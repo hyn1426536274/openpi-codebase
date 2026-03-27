@@ -46,6 +46,23 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
+# Monkey-patch to fix 'List' feature type error in old datasets
+try:
+    import datasets.features.features as features
+
+    _OLD_GENERATE_FROM_DICT = features.generate_from_dict
+
+    def _new_generate_from_dict(obj):
+        if isinstance(obj, dict) and obj.get("_type") == "List":
+            obj["_type"] = "Sequence"
+        return _OLD_GENERATE_FROM_DICT(obj)
+
+    features.generate_from_dict = _new_generate_from_dict
+except (ImportError, AttributeError):
+    # If datasets or the function doesn't exist, do nothing.
+    pass
+# End of monkey-patch
+
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -84,6 +101,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
         wandb.init(
+            entity="huangyinuo321-uestc",
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
@@ -328,9 +346,17 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+    elif config.overwrite:
+        # 核心修复：只有主进程执行删除和创建
+        if is_main:
+            if config.checkpoint_dir.exists():
+                shutil.rmtree(config.checkpoint_dir)
+                logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+            config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # # 关键：所有进程在此集合，等待主进程删完并建好目录
+        if use_ddp:
+            dist.barrier() 
+
 
     # Create checkpoint directory with experiment name
     if not resuming:
@@ -357,37 +383,37 @@ def train_loop(config: _config.TrainConfig):
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
+    # HACK: skip sampling images for wandb, it takes too mush time.
+    # # Log sample images to wandb on first batch
+    # if is_main and config.wandb_enabled and not resuming:
+    #     # Create a separate data loader for sample batch to avoid consuming the main loader
+    #     sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+    #     sample_batch = next(iter(sample_data_loader))
+    #     # Convert observation and actions to torch tensors
+    #     observation, actions = sample_batch
+    #     sample_batch = observation.to_dict()
+    #     sample_batch["actions"] = actions
 
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
-        sample_batch = observation.to_dict()
-        sample_batch["actions"] = actions
+    #     # Create sample images for wandb
+    #     images_to_log = []
+    #     # Get batch size from the first image tensor
+    #     batch_size = next(iter(sample_batch["image"].values())).shape[0]
+    #     for i in range(min(5, batch_size)):
+    #         # Concatenate all camera views horizontally for this batch item
+    #         # Convert from NCHW to NHWC format for wandb
+    #         img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+    #         img_concatenated = img_concatenated.cpu().numpy()
+    #         images_to_log.append(wandb.Image(img_concatenated))
 
-        # Create sample images for wandb
-        images_to_log = []
-        # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
-        for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+    #     wandb.log({"camera_views": images_to_log}, step=0)
 
-        wandb.log({"camera_views": images_to_log}, step=0)
-
-        # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
+    #     # Clear sample batch from memory aggressively
+    #     del sample_batch, observation, actions, images_to_log, img_concatenated
+    #     del sample_data_loader  # Also delete the sample data loader
+    #     gc.collect()
+    #     if torch.cuda.is_available():
+    #         torch.cuda.empty_cache()
+    #     logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):

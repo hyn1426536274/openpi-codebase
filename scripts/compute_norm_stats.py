@@ -19,6 +19,19 @@ import openpi.transforms as transforms
 class RemoveStrings(transforms.DataTransformFn):
     def __call__(self, x: dict) -> dict:
         return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+    
+class RemoveVisualData(transforms.DataTransformFn):
+    """移除图像和视频数据，避免计算 norm stats 时产生不必要的解码开销。"""
+    def __call__(self, x: dict) -> dict:
+        print("show")
+        print(x.items())
+        # exit()
+        # 过滤掉所有包含 image, depth 或 video 的 key
+        visual_keys = ["image", "depth", "video"]
+        return {
+            k: v for k, v in x.items() 
+            if not any(v_key in k.lower() for v_key in visual_keys)
+        }
 
 
 def create_torch_dataloader(
@@ -29,9 +42,12 @@ def create_torch_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
+    print("creating torch dataloader ...")
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    print("dataset created")
+    print("transforming dataset ...")
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -39,6 +55,7 @@ def create_torch_dataloader(
             *data_config.data_transforms.inputs,
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
+            RemoveVisualData() # add
         ],
     )
     if max_frames is not None and max_frames < len(dataset):
@@ -63,6 +80,7 @@ def create_rlds_dataloader(
     batch_size: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
+    print("creating rlds dataloader ...")
     dataset = _data_loader.create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=False)
     dataset = _data_loader.IterableTransformedDataset(
         dataset,
@@ -71,6 +89,7 @@ def create_rlds_dataloader(
             *data_config.data_transforms.inputs,
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
+            RemoveVisualData() # add
         ],
         is_batched=True,
     )
@@ -89,8 +108,9 @@ def create_rlds_dataloader(
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
-
+    
     if data_config.rlds_data_dir is not None:
+        print(f"rlds dataset: {data_config.rlds_data_dir}")
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )
@@ -101,7 +121,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
-
+    print("start computing stats")
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
