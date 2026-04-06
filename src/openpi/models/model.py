@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PI05_KI = "pi05_ki"
 
 
 # The model always expects these images
@@ -106,6 +107,18 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # pi05-ki model specific fields - subtask generation stream.
+    subtask_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+    subtask_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+    subtask_token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
+    subtask_token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+
+    # pi05-ki model specific fields - FAST action token stream.
+    fast_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+    fast_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+    fast_token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
+    fast_token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +139,14 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            subtask_tokenized_prompt=data.get("subtask_tokenized_prompt"),
+            subtask_tokenized_prompt_mask=data.get("subtask_tokenized_prompt_mask"),
+            subtask_token_ar_mask=data.get("subtask_token_ar_mask"),
+            subtask_token_loss_mask=data.get("subtask_token_loss_mask"),
+            fast_tokenized_prompt=data.get("fast_tokenized_prompt"),
+            fast_tokenized_prompt_mask=data.get("fast_tokenized_prompt_mask"),
+            fast_token_ar_mask=data.get("fast_token_ar_mask"),
+            fast_token_loss_mask=data.get("fast_token_loss_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +226,14 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        subtask_tokenized_prompt=observation.subtask_tokenized_prompt,
+        subtask_tokenized_prompt_mask=observation.subtask_tokenized_prompt_mask,
+        subtask_token_ar_mask=observation.subtask_token_ar_mask,
+        subtask_token_loss_mask=observation.subtask_token_loss_mask,
+        fast_tokenized_prompt=observation.fast_tokenized_prompt,
+        fast_tokenized_prompt_mask=observation.fast_tokenized_prompt_mask,
+        fast_token_ar_mask=observation.fast_token_ar_mask,
+        fast_token_loss_mask=observation.fast_token_loss_mask,
     )
 
 

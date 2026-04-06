@@ -96,6 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        knowledge_isolation: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -155,7 +156,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 self._debug_gc_printed = True
 
             # Define the complete layer computation function for gradient checkpointing
-            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
+            def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, knowledge_isolation=False):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
 
                 query_states = []
@@ -198,14 +199,26 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                if knowledge_isolation:
+                    num_prefix_tokens = inputs_embeds[0].shape[1]
+                    att_output, _ = modeling_gemma.eager_attention_forward_ki(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                        num_prefix_tokens=num_prefix_tokens,
+                    )
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -249,10 +262,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                         adarms_cond,
                         use_reentrant=False,
                         preserve_rng_state=False,
+                        knowledge_isolation=knowledge_isolation,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
-                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
+                        layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond, knowledge_isolation=knowledge_isolation
                     )
 
                 # Old code removed - now using compute_layer_complete function above

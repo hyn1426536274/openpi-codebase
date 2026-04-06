@@ -161,6 +161,38 @@ class ModelTransformFactory(GroupFactory):
                         )
                     ],
                 )
+            case _model.ModelType.PI05_KI:
+                assert isinstance(model_config, pi0_config.Pi0Config)
+                tokenizer_cls = (
+                    _tokenizer.FASTTokenizer
+                    if model_config.fast_model_tokenizer is None
+                    else model_config.fast_model_tokenizer
+                )
+                tokenizer_kwargs = (
+                    {}
+                    if model_config.fast_model_tokenizer_kwargs is None
+                    else model_config.fast_model_tokenizer_kwargs
+                )
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeKIInputs(
+                            fast_tokenizer=tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                            subtask_tokenizer=_tokenizer.SubtaskTokenizer(model_config.max_token_len),
+                            paligemma_tokenizer=_tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                    outputs=[
+                        _transforms.ExtractFASTActions(
+                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                            action_horizon=model_config.action_horizon,
+                            action_dim=model_config.action_dim,
+                        ),
+                    ],
+                )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -787,6 +819,36 @@ _CONFIGS = [
         # assets_base_dir="/root/Training/ki/data/libero",
         num_train_steps=30_000,
         num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_ki_libero_torch_debug",  # PI05_KI (knowledge isolation) torch debug config
+        project_name="pi05_ki_research",
+        model=pi0_config.Pi0Config(
+            pi05_ki=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        pytorch_training_precision="float32",
+        data=LeRobotLiberoDataConfig(
+            repo_id="/root/Training/ki/data/libero/datasets_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(pi05_ki=True, action_horizon=10).get_freeze_filter(),
+        pytorch_weight_path="/root/Models/pi05_base_pytorch",
+        checkpoint_base_dir="/root/Training/ki/outputs/models/ckpts-torch-ki",
+        num_train_steps=50_000,
+        num_workers=4,
     ),
     #
     # Fine-tuning Aloha configs.

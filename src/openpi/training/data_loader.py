@@ -127,6 +127,22 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class _SubtaskFromPrompt:
+    """Injects a 'subtask' field copied from 'prompt' as a pseudo-subtask annotation.
+
+    Used for PI05_KI training on datasets (e.g. LIBERO) that lack fine-grained
+    skill/subtask annotations. The task prompt itself serves as the subtask,
+    enabling subtask AR loss to train from day one.
+    Replace with annotation-based lookup when proper subtask labels are available.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        prompt = data.get("prompt")
+        if prompt is not None:
+            data["subtask"] = prompt if isinstance(prompt, str) else prompt.item()
+        return data
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -147,6 +163,12 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    # PI05_KI mode: inject "subtask" field using the task prompt as pseudo-subtask.
+    # This allows subtask AR loss to train even without fine-grained annotations.
+    # Replace with annotation-based SubtaskFromAnnotation when annotations are available.
+    if getattr(model_config, "pi05_ki", False):
+        dataset = TransformedDataset(dataset, [_SubtaskFromPrompt()])
 
     return dataset
 

@@ -325,6 +325,83 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenizeKIInputs(DataTransformFn):
+    """Tokenizes inputs for PI05_KI (Knowledge Isolation) training.
+
+    Produces three token sequences per sample:
+      1. Main prompt tokens (PaligemmaTokenizer) — for the action expert flow-matching forward pass
+      2. Subtask tokens (SubtaskTokenizer) — prefix-LM sequence for subtask AR loss
+      3. FAST action tokens (FASTTokenizer) — prefix-LM sequence for FAST AR loss
+
+    The subtask and FAST sequences both follow the prefix-LM convention:
+      - ar_mask=0 / loss_mask=False on the prefix (Task+State)
+      - ar_mask=1 / loss_mask=True  on the postfix (Subtask or Action tokens)
+    """
+
+    fast_tokenizer: _tokenizer.FASTTokenizer
+    subtask_tokenizer: _tokenizer.SubtaskTokenizer
+    paligemma_tokenizer: _tokenizer.PaligemmaTokenizer
+    discrete_state_input: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if (prompt := data.pop("prompt", None)) is None:
+            raise ValueError("Prompt is required")
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        if self.discrete_state_input:
+            if (state := data.get("state", None)) is None:
+                raise ValueError("State is required.")
+        else:
+            state = None
+        assert self.discrete_state_input, (
+            "discrete_state_input must be True for knowledge isolation (Pi05_KI model)."
+        )
+
+        subtask = data.pop("subtask", None)
+        actions = data.get("actions", None)
+
+        if subtask is not None:
+            # Main prompt uses subtask text (conditioning on subtask for action expert)
+            tokens, token_masks = self.paligemma_tokenizer.tokenize(subtask, state)
+            fast_tokens, fast_token_mask, fast_ar_mask, fast_loss_mask = self.fast_tokenizer.tokenize(
+                subtask, state, actions
+            )
+        else:
+            tokens, token_masks = self.paligemma_tokenizer.tokenize(prompt, state)
+            fast_tokens, fast_token_mask, fast_ar_mask, fast_loss_mask = self.fast_tokenizer.tokenize(
+                prompt, state, actions
+            )
+
+        # Subtask sequence always uses task prompt (predicts subtask from task+state)
+        subtask_tokens, subtask_token_mask, subtask_ar_mask, subtask_loss_mask = self.subtask_tokenizer.tokenize(
+            prompt, state, subtask
+        )
+
+        return {
+            **data,
+            "fast_tokenized_prompt": fast_tokens,
+            "fast_tokenized_prompt_mask": fast_token_mask,
+            "fast_token_ar_mask": fast_ar_mask,
+            "fast_token_loss_mask": fast_loss_mask,
+            "subtask_tokenized_prompt": subtask_tokens,
+            "subtask_tokenized_prompt_mask": subtask_token_mask,
+            "subtask_token_ar_mask": subtask_ar_mask,
+            "subtask_token_loss_mask": subtask_loss_mask,
+            # For action expert (flow-matching forward pass)
+            "tokenized_prompt": tokens,
+            "tokenized_prompt_mask": token_masks,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PromptFromLeRobotItem(DataTransformFn):
+    """Extracts a prompt from the current LeRobot dataset item's 'task' field."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        return {**data, "prompt": data.pop("task")}
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to the model action dimension."""
 

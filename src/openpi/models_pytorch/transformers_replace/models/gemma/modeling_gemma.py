@@ -253,6 +253,81 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+def eager_attention_forward_ki(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    num_prefix_tokens: int,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """Knowledge Isolation (KI) attention.
+
+    Identical to eager_attention_forward except that, when computing attention
+    for suffix (action-expert) queries, the prefix (VLM backbone) key/value
+    tensors are detached before the matmul.  This prevents gradients from the
+    action expert from flowing back into the VLM backbone through the cross-
+    attention path.
+
+    Sequence layout:  [prefix_tokens (VLM) | suffix_tokens (action expert)]
+    num_prefix_tokens: length of the prefix segment.
+    """
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    # Split query into prefix (VLM) and suffix (action expert) parts.
+    prefix_query = query[:, :, :num_prefix_tokens, :]   # Q_backbone
+    suffix_query = query[:, :, num_prefix_tokens:, :]   # Q_expert
+
+    # Raw key/value splits (before repeat_kv, used for detach).
+    prefix_key   = key[:, :, :num_prefix_tokens, :]
+    suffix_key   = key[:, :, num_prefix_tokens:, :]
+    prefix_value = value[:, :, :num_prefix_tokens, :]
+    suffix_value = value[:, :, num_prefix_tokens:, :]
+
+    # 1. Prefix query: normal attention over full key sequence (gradients intact).
+    weights_prefix = torch.matmul(prefix_query, key_states.transpose(2, 3)) * scaling
+
+    # 2. Suffix query: attend to prefix K with detach (gradient isolation) + suffix K normally.
+    ki_key_states = repeat_kv(
+        torch.cat([prefix_key.detach(), suffix_key], dim=2),
+        module.num_key_value_groups,
+    )
+    weights_suffix = torch.matmul(suffix_query, ki_key_states.transpose(2, 3)) * scaling
+
+    # Concatenate weights so attention_mask and softmax can be applied jointly.
+    attn_weights = torch.cat([weights_prefix, weights_suffix], dim=2)
+
+    if attention_mask is not None:
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # 3. Split weights and apply to values.
+    weights_for_prefix = attn_weights[:, :, :num_prefix_tokens, :]
+    weights_for_suffix = attn_weights[:, :, num_prefix_tokens:, :]
+
+    # Prefix output: full value states, gradients intact.
+    output_prefix = torch.matmul(weights_for_prefix, value_states)
+
+    # Suffix output: prefix V detached, suffix V normal.
+    ki_value_states = repeat_kv(
+        torch.cat([prefix_value.detach(), suffix_value], dim=2),
+        module.num_key_value_groups,
+    )
+    output_suffix = torch.matmul(weights_for_suffix, ki_value_states)
+
+    attn_output = torch.cat([output_prefix, output_suffix], dim=2)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
 class GemmaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

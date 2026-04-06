@@ -553,13 +553,23 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
+            # Handle different return types from forward():
+            #   - Tensor: standard pi0 / pi05 flow-matching loss (per-element)
+            #   - list/tuple: stacked and averaged
+            #   - dict: PI05_KI multi-loss {"action": t, "subtask": t, "fast": t}
+            per_loss_dict = {}
+            if isinstance(losses, dict):
+                # Sum all sub-losses to get the total scalar loss for backward.
+                # Each value is already a scalar (mean reduced inside forward()).
+                loss = sum(losses.values())
+                per_loss_dict = {f"loss/{k}": v.item() for k, v in losses.items()}
+            elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-            loss = losses.mean()
+                loss = losses.mean()
+            elif isinstance(losses, torch.Tensor):
+                loss = losses.mean()
+            else:
+                loss = torch.tensor(losses, device=device, dtype=torch.float32)
 
             # Backward pass
             loss.backward()
@@ -583,13 +593,13 @@ def train_loop(config: _config.TrainConfig):
 
             # Collect stats
             if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+                info = {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+                info.update(per_loss_dict)  # add loss/action, loss/subtask, loss/fast if PI05_KI
+                infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
@@ -621,6 +631,10 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    # Log per-loss breakdown (loss/action, loss/subtask, loss/fast) for PI05_KI
+                    sub_loss_keys = [k for k in infos[0] if k.startswith("loss/")]
+                    for k in sub_loss_keys:
+                        log_payload[k] = sum(info[k] for info in infos) / len(infos)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

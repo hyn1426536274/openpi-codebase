@@ -48,6 +48,62 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+class SubtaskTokenizer:
+    def __init__(self, max_len: int = 48):
+        self._max_len = max_len
+        # Download base PaliGemma tokenizer
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, subtask: str | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+        if state is not None:
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+            prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+        else:
+            # Pi0 format: state is part of continuous action expert input
+            prefix_tokens = self._paligemma_tokenizer.encode(cleaned_text, add_bos=True) + self._paligemma_tokenizer.encode("\n")
+
+        if subtask is not None:
+            postfix_tokens = self._paligemma_tokenizer.encode(f"Subtask: {subtask}.", add_eos=True)
+        else:
+            postfix_tokens = []
+
+        # Create output token sequence & masks
+        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+
+        # Pad tokens to max length
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len

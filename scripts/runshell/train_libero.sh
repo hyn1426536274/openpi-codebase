@@ -23,7 +23,12 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 # 参数 2: 配置名称
 CONFIG_NAME="${2:-pi05_libero_torch_debug}"
 # 参数 3: 实验名称
+# 若未指定，生成新的时间戳名称（全新训练）
+# 若要 resume，请显式传入已有的实验名称，同时脚本会自动检测 checkpoint
 EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"
+
+# 参数 4: 是否 resume（默认 false）
+RESUME="${4:-false}"
 
 # 3. 动态生成 CUDA_VISIBLE_DEVICES
 # 注意：在某些集群环境下（如使用了 SLURM 或 Docker 限制），
@@ -64,10 +69,17 @@ echo "---------------------------------------"
 #     # If datasets or the function doesn't exist, do nothing.
 #     pass
 # # End of monkey-patch
+# 根据是否 resume 选择 --resume 或 --overwrite
+if [ "${RESUME}" = "true" ]; then
+    TRAIN_MODE_FLAG="--resume"
+else
+    TRAIN_MODE_FLAG="--overwrite"
+fi
+
 torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="${NUM_GPUS}" \
     scripts/train_pytorch.py "${CONFIG_NAME}" \
     --exp-name="${EXP_NAME}" \
-    --overwrite
+    ${TRAIN_MODE_FLAG}

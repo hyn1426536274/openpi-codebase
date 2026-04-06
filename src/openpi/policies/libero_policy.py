@@ -64,8 +64,8 @@ class LiberoInputs(transforms.DataTransformFn):
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
-                # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                # We only mask padding images for pi0 model, not pi0-FAST or pi05-KI. Do not change this for your own dataset.
+                "right_wrist_0_rgb": np.True_ if self.model_type in (_model.ModelType.PI0_FAST, _model.ModelType.PI05_KI) else np.False_,
             },
         }
 
@@ -79,6 +79,10 @@ class LiberoInputs(transforms.DataTransformFn):
         # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # PI05_KI mode: pass subtask field if present (injected by _SubtaskFromPrompt or annotation).
+        if self.model_type == _model.ModelType.PI05_KI and "subtask" in data:
+            inputs["subtask"] = data["subtask"]
 
         return inputs
 

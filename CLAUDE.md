@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Answer language
+Use chinese to answer the questions
+
+
 ## Overview
 
 OpenPI is an open-source package from Physical Intelligence for training and running Vision-Language-Action (VLA) models for robotics. It contains three model architectures:

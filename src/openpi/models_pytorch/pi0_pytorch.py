@@ -1,5 +1,6 @@
 import logging
 import math
+from collections import defaultdict
 
 import torch
 from torch import Tensor
@@ -85,7 +86,8 @@ class PI0Pytorch(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.pi05 = config.pi05
+        self.pi05 = config.pi05 or config.pi05_ki
+        self.pi05_ki = config.pi05_ki
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -314,8 +316,24 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+    def forward(self, observation, actions, noise=None, time=None) -> Tensor | dict:
+        """Do a full training forward pass and compute the loss.
+
+        Returns:
+          - PI0/PI05 mode: flow-matching loss tensor [B, T, D]
+          - PI05_KI mode: dict with keys "action", "subtask", "fast"
+        """
+        loss = defaultdict(float)
+
+        # PI05_KI: compute language model losses first (subtask + fast AR)
+        knowledge_isolation = False
+        if self.pi05_ki and (
+            observation.fast_tokenized_prompt is not None
+            and observation.subtask_tokenized_prompt is not None
+        ):
+            knowledge_isolation = True
+            loss.update(self.forward_language_model(observation))
+
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -347,7 +365,7 @@ class PI0Pytorch(nn.Module):
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, knowledge_isolation):
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -355,11 +373,12 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                knowledge_isolation=knowledge_isolation,
             )
             return suffix_out
 
         suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, knowledge_isolation
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
@@ -371,7 +390,101 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        flow_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        if self.pi05_ki:
+            loss["action"] = flow_loss.mean()
+            return loss
+        return flow_loss
+
+    def forward_language_model(self, observation) -> dict:
+        """Compute autoregressive token losses (subtask + fast) for PI05_KI training.
+
+        Both losses are cross-entropy AR losses over the respective token sequences.
+        Only tokens where loss_mask=True contribute to the loss (i.e. the postfix / answer part).
+        """
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        losses = {}
+
+        subtask_tokenized_prompt      = observation.subtask_tokenized_prompt
+        subtask_tokenized_prompt_mask = observation.subtask_tokenized_prompt_mask
+        subtask_token_ar_mask         = observation.subtask_token_ar_mask
+        subtask_token_loss_mask       = observation.subtask_token_loss_mask
+
+        fast_tokenized_prompt      = observation.fast_tokenized_prompt
+        fast_tokenized_prompt_mask = observation.fast_tokenized_prompt_mask
+        fast_token_ar_mask         = observation.fast_token_ar_mask
+        fast_token_loss_mask       = observation.fast_token_loss_mask
+
+        # Embed prefix with subtask / fast token sequences respectively
+        subtask_prefix_embs, subtask_prefix_pad_masks, subtask_prefix_att_masks = self.embed_prefix(
+            images, img_masks, subtask_tokenized_prompt, subtask_tokenized_prompt_mask
+        )
+        fast_prefix_embs, fast_prefix_pad_masks, fast_prefix_att_masks = self.embed_prefix(
+            images, img_masks, fast_tokenized_prompt, fast_tokenized_prompt_mask
+        )
+
+        if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            subtask_prefix_embs = subtask_prefix_embs.to(dtype=torch.bfloat16)
+            fast_prefix_embs    = fast_prefix_embs.to(dtype=torch.bfloat16)
+
+        # Build prefix-LM attention masks (bidirectional on prefix, causal on answer tokens)
+        subtask_pad_masks  = subtask_prefix_pad_masks
+        subtask_att_masks  = subtask_prefix_att_masks.clone()
+        subtask_att_masks[:, -subtask_token_ar_mask.shape[-1]:] = subtask_token_ar_mask
+        subtask_att_2d_masks     = make_att_2d_masks(subtask_pad_masks, subtask_att_masks)
+        subtask_position_ids     = torch.cumsum(subtask_pad_masks, dim=1) - 1
+        subtask_att_2d_masks_4d  = self._prepare_attention_masks_4d(subtask_att_2d_masks)
+
+        fast_pad_masks  = fast_prefix_pad_masks
+        fast_att_masks  = fast_prefix_att_masks.clone()
+        fast_att_masks[:, -fast_token_ar_mask.shape[-1]:] = fast_token_ar_mask
+        fast_att_2d_masks     = make_att_2d_masks(fast_pad_masks, fast_att_masks)
+        fast_position_ids     = torch.cumsum(fast_pad_masks, dim=1) - 1
+        fast_att_2d_masks_4d  = self._prepare_attention_masks_4d(fast_att_2d_masks)
+
+        def forward_func(prefix_embs, att_2d_masks_4d, position_ids):
+            (prefix_out, _), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=False,
+                adarms_cond=[None, None],
+            )
+            return prefix_out
+
+        subtask_prefix_out = self._apply_checkpoint(forward_func, subtask_prefix_embs, subtask_att_2d_masks_4d, subtask_position_ids)
+        fast_prefix_out    = self._apply_checkpoint(forward_func, fast_prefix_embs,    fast_att_2d_masks_4d,    fast_position_ids)
+
+        # Project to vocabulary logits via the LM head
+        def language_out_proj_func(hidden, logits_to_keep):
+            return self.paligemma_with_expert.paligemma.lm_head(hidden[:, -logits_to_keep:, :])
+
+        subtask_logits = self._apply_checkpoint(language_out_proj_func, subtask_prefix_out, subtask_tokenized_prompt.shape[1])
+        fast_logits    = self._apply_checkpoint(language_out_proj_func, fast_prefix_out,    fast_tokenized_prompt.shape[1])
+
+        def token_ar_loss(logits, labels, loss_mask):
+            """Cross-entropy AR loss masked to postfix tokens only."""
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                reduction="none",
+            )
+            loss = loss.view_as(labels) * loss_mask
+            return loss.sum() / (loss_mask.sum() + 1e-6)
+
+        subtask_shift_logits    = subtask_logits[:, :-1, :].contiguous()
+        subtask_shift_labels    = subtask_tokenized_prompt[:, 1:].contiguous()
+        subtask_shift_loss_mask = subtask_token_loss_mask[:, 1:].float().contiguous()
+        losses["subtask"] = token_ar_loss(subtask_shift_logits, subtask_shift_labels, subtask_shift_loss_mask)
+
+        fast_shift_logits    = fast_logits[:, :-1, :].contiguous()
+        fast_shift_labels    = fast_tokenized_prompt[:, 1:].contiguous()
+        fast_shift_loss_mask = fast_token_loss_mask[:, 1:].float().contiguous()
+        losses["fast"] = token_ar_loss(fast_shift_logits, fast_shift_labels, fast_shift_loss_mask)
+
+        return losses
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
