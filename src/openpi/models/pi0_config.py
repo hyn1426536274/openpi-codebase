@@ -31,8 +31,9 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # PI05_KI: PI05 + subtask generation head + Knowledge Isolation attention
     pi05_ki: bool = False
-    # FAST tokenizer HF repo ID or local path (read by ModelTransformFactory)
-    fast_model_tokenizer: str | None = None
+    # FAST tokenizer class (for PI0_FAST). For PI05_KI, use fast_model_tokenizer_kwargs instead.
+    fast_model_tokenizer: type | None = None
+    # Kwargs to pass to FASTTokenizer (e.g., {"fast_tokenizer_path": "/path/to/tokenizer"})
     fast_model_tokenizer_kwargs: dict | None = None
 
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.

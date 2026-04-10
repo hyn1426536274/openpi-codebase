@@ -6,34 +6,33 @@ WANDB_API_KEY="wandb_v1_Ag0TqrTlfRpXZACvOO4BO5NkpUk_CSoMmERXFIB4o2mdKM9uhExyhGyM
 export WANDB_API_KEY
 
 # 1. 环境激活与路径跳转
-cd /root/Training/ki/openpi
+cd /workspace/code/openpi-codebase
 source .venv/bin/activate 2>/dev/null || true
 
-# 2. 参数处理与 GPU 自动检测
-# 获取系统中可用的 GPU 总数
-AVAILABLE_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+# 防止 HuggingFace datasets 首次加载时尝试网络请求（本地数据集不需要 Hub）
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+# 使用本地磁盘作为 HF datasets 缓存（避免 NFS 上的缓存 I/O 慢）(持久化？)
+export HF_DATASETS_CACHE="/workspace/tmp/hf_datasets_cache"
 
-# 如果检测失败或为 0，默认设为 1（作为保底）
+# 2. 参数处理与 GPU 自动检测
+AVAILABLE_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
 if [ "$AVAILABLE_GPUS" -eq 0 ]; then
     AVAILABLE_GPUS=1
 fi
 
-# 参数 1: 显卡数量 (如果未输入，则使用检测到的全部显卡)
+# 参数 1: 显卡数量
 NUM_GPUS="${1:-$AVAILABLE_GPUS}"
-# 参数 2: 配置名称
-CONFIG_NAME="${2:-pi05_libero_torch_debug}"
+# 参数 2: 配置名称（默认 val_test 验证配置）
+# CONFIG_NAME="${2:-pi05_libero_val_test}" # 25
+# CONFIG_NAME="${2:-pi05_libero_torch_debug}" # libero24
+CONFIG_NAME="${2:-pi05_ki_libero_torch_debug}" # 23
 # 参数 3: 实验名称
-# 若未指定，生成新的时间戳名称（全新训练）
-# 若要 resume，请显式传入已有的实验名称，同时脚本会自动检测 checkpoint
 EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"
-
 # 参数 4: 是否 resume（默认 false）
 RESUME="${4:-false}"
 
 # 3. 动态生成 CUDA_VISIBLE_DEVICES
-# 注意：在某些集群环境下（如使用了 SLURM 或 Docker 限制），
-# 物理显卡索引不一定是从 0 到 N-1，但对于大多数九章/H800 机器，
-# 默认按顺序排列是安全的。
 G_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
 export CUDA_VISIBLE_DEVICES="${G_IDS}"
 
@@ -42,44 +41,25 @@ echo "Detected Total GPUs: ${AVAILABLE_GPUS}"
 echo "Using GPUs:          ${CUDA_VISIBLE_DEVICES} (Count: ${NUM_GPUS})"
 echo "Config:              ${CONFIG_NAME}"
 echo "Exp:                 ${EXP_NAME}"
+echo "Resume:              ${RESUME}"
 echo "---------------------------------------"
 
-# 4. 自动应用必要的补丁 (按需取消注释)
-# cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/ 2>/dev/null || true
-
-# 5. 启动训练
-# 使用 torchrun 进行分布式训练
-# 注意：如果只使用 1 张卡，torchrun 依然有效，但在多卡（如 H800）下效率更高
-
-# datasets==0.36.0 huggingface-hub=0.32.3 | you may add patch on your code
-# see https://github.com/Physical-Intelligence/openpi/issues/561
-# # Monkey-patch to fix 'List' feature type error in old datasets
-# try:
-#     import datasets.features.features as features
-
-#     _OLD_GENERATE_FROM_DICT = features.generate_from_dict
-
-#     def _new_generate_from_dict(obj):
-#         if isinstance(obj, dict) and obj.get("_type") == "List":
-#             obj["_type"] = "Sequence"
-#         return _OLD_GENERATE_FROM_DICT(obj)
-
-#     features.generate_from_dict = _new_generate_from_dict
-# except (ImportError, AttributeError):
-#     # If datasets or the function doesn't exist, do nothing.
-#     pass
-# # End of monkey-patch
-# 根据是否 resume 选择 --resume 或 --overwrite
+# 4. 根据是否 resume 选择标志
 if [ "${RESUME}" = "true" ]; then
     TRAIN_MODE_FLAG="--resume"
 else
     TRAIN_MODE_FLAG="--overwrite"
 fi
 
+# 5. 启动训练
+# 用法示例：
+#   验证 train/val:  bash scripts/runshell/train_libero.sh 1 pi05_libero_val_test
+#   正式 pi05 训练:  bash scripts/runshell/train_libero.sh 8 pi05_libero_torch_debug my_exp
+#   KI 训练:         bash scripts/runshell/train_libero.sh 1 pi05_ki_libero_torch_debug ki_exp
 torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="${NUM_GPUS}" \
     scripts/train_pytorch.py "${CONFIG_NAME}" \
-    --exp-name="${EXP_NAME}" \
+    --exp_name="${EXP_NAME}" \
     ${TRAIN_MODE_FLAG}

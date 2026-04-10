@@ -59,6 +59,8 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            # Wire up subtask generation if the model supports it (PI05_KI)
+            self._generate_subtask = getattr(model, "generate_subtask", None)
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
@@ -104,6 +106,42 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def generate_subtask(self, obs: dict) -> dict:
+        """Generate a subtask description from the current observation.
+
+        Only available for PI05_KI models. Uses autoregressive decoding
+        through the PaliGemma backbone to produce a natural-language subtask.
+
+        Args:
+            obs: Raw observation dict (same format as infer() input).
+
+        Returns:
+            Dict with key "subtask" containing the extracted subtask string,
+            or None if parsing fails.
+        """
+        if not self._is_pytorch_model or self._generate_subtask is None:
+            raise RuntimeError("generate_subtask is only available for PI05_KI PyTorch models")
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(
+            lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs
+        )
+
+        observation = _model.Observation.from_dict(inputs)
+        raw_subtasks = self._generate_subtask(self._pytorch_device, observation)
+        subtask_text = raw_subtasks[0] if raw_subtasks else None
+
+        # Parse "Subtask: {text}." format if present, otherwise use raw text
+        if subtask_text and "Subtask:" in subtask_text:
+            after = subtask_text.split("Subtask:")[-1]
+            if "." in after:
+                subtask_text = after.split(".")[0].strip()
+            else:
+                subtask_text = after.strip()
+
+        return {"subtask": subtask_text}
 
     @property
     def metadata(self) -> dict[str, Any]:

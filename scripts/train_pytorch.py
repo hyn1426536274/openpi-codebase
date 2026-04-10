@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+from collections import defaultdict
 import dataclasses
 import gc
 import logging
@@ -63,6 +64,13 @@ except (ImportError, AttributeError):
     pass
 # End of monkey-patch
 
+# changed lerobot_dataset.py : 
+# to fix : TypeError: stack(): argument 'tensors' (position 1) must be tuple of Tensors, not Column
+# timestamps = torch.stack(list(self.hf_dataset["timestamp"])).numpy()
+# episode_indices = torch.stack(list(self.hf_dataset["episode_index"])).numpy()
+# ...
+# query_timestamps[key] = torch.stack(list(timestamps)).tolist()
+# key: torch.stack(list(self.hf_dataset.select(q_idx)[key]))
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -141,9 +149,70 @@ def set_seed(seed: int, local_rank: int):
 
 
 def build_datasets(config: _config.TrainConfig):
-    # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
-    return data_loader, data_loader.data_config()
+    """Build training data loader, optionally with a validation loader.
+
+    Returns:
+        (train_loader, data_config, val_loader) where val_loader is None
+        when config.val_ratio == 0.
+    """
+    # debug_episodes: limit loaded episodes for quick pipeline verification
+    debug_eps = None
+    if config.debug_episodes is not None:
+        debug_eps = list(range(config.debug_episodes))
+        print(f"[BUILD-DEBUG] debug_episodes={config.debug_episodes}, loading only episodes {debug_eps}", flush=True)
+
+    print(f"[BUILD-DEBUG] val_ratio={config.val_ratio}, repo_id={getattr(config.data, 'repo_id', 'fake')}", flush=True)
+    if config.val_ratio > 0 and getattr(config.data, "repo_id", "fake") != "fake":
+        print(f"[BUILD-DEBUG] Taking val split path...", flush=True)
+        data_config = config.data.create(config.assets_dirs, config.model)
+        print(f"[BUILD-DEBUG] data_config created, calling create_torch_data_loader_with_val...", flush=True)
+        train_loader, val_loader = _data.create_torch_data_loader_with_val(
+            data_config,
+            model_config=config.model,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            val_ratio=config.val_ratio,
+            seed=config.seed,
+            shuffle=True,
+            num_workers=config.num_workers,
+            framework="pytorch",
+            episodes=debug_eps,
+        )
+        print(f"[BUILD-DEBUG] Val split done, returning train + val loaders", flush=True)
+        return train_loader, data_config, val_loader
+    print(f"[BUILD-DEBUG] Taking standard path (no val)...", flush=True)
+    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True, episodes=debug_eps)
+    print(f"[BUILD-DEBUG] Standard loader created", flush=True)
+    return data_loader, data_loader.data_config(), None
+
+
+@torch.no_grad()
+def validate(model, val_loader, device, num_batches):
+    """Compute validation loss without gradient updates.
+
+    Runs the model in eval mode on up to `num_batches` from val_loader,
+    then restores train mode. Returns a dict of averaged val metrics.
+    """
+    model.eval()
+    val_losses = defaultdict(list)
+    print(f"[VALIDATE-DEBUG] Starting validation, num_batches={num_batches}", flush=True)
+    for i, (observation, actions) in enumerate(val_loader):
+        print(f"[VALIDATE-DEBUG] Got val batch {i}", flush=True)
+        if i >= num_batches:
+            break
+        observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+        actions = actions.to(device).float()  # noqa: PLW2901
+        losses = model(observation, actions)
+        if isinstance(losses, dict):
+            for k, v in losses.items():
+                val_losses[f"val_loss/{k}"].append(v.item())
+            val_losses["val_loss/total"].append(sum(v.item() for v in losses.values()))
+        else:
+            val_losses["val_loss/action"].append(losses.mean().item())
+    model.train()
+    if not val_losses:
+        return {}
+    return {k: sum(v) / len(v) for k, v in val_losses.items()}
 
 
 def get_model_state_dict(model):
@@ -355,7 +424,7 @@ def train_loop(config: _config.TrainConfig):
             config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         # # 关键：所有进程在此集合，等待主进程删完并建好目录
         if use_ddp:
-            dist.barrier() 
+            dist.barrier()
 
 
     # Create checkpoint directory with experiment name
@@ -382,7 +451,9 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
-    loader, data_config = build_datasets(config)
+    print(f"[TRAIN-DEBUG] Calling build_datasets...", flush=True)
+    loader, data_config, val_loader = build_datasets(config)
+    print(f"[TRAIN-DEBUG] build_datasets done. val_loader={'present' if val_loader else 'None'}", flush=True)
     # HACK: skip sampling images for wandb, it takes too mush time.
     # # Log sample images to wandb on first batch
     # if is_main and config.wandb_enabled and not resuming:
@@ -537,7 +608,12 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
+        print(f"[TRAIN-DEBUG] Entering data iter loop (global_step={global_step})...", flush=True)
+        batch_count = 0
         for observation, actions in loader:
+            batch_count += 1
+            if batch_count <= 2:
+                print(f"[TRAIN-DEBUG] Got batch {batch_count}, global_step={global_step}", flush=True)
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
@@ -639,6 +715,25 @@ def train_loop(config: _config.TrainConfig):
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
+
+            # Validation
+            if (
+                val_loader is not None
+                and global_step > 0
+                and global_step % config.val_interval == 0
+                and is_main
+            ):
+                print(f"[TRAIN-DEBUG] Starting validation at step {global_step}...", flush=True)
+                raw_model = model.module if use_ddp else model
+                val_metrics = validate(raw_model, val_loader, device, config.val_batches)
+                print(f"[TRAIN-DEBUG] Validation done: {val_metrics}", flush=True)
+                if val_metrics:
+                    logging.info(
+                        f"[val] step={global_step} "
+                        + " ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
+                    )
+                    if config.wandb_enabled:
+                        wandb.log(val_metrics, step=global_step)
 
             global_step += 1
             # Save checkpoint using the new mechanism

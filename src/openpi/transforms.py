@@ -360,6 +360,10 @@ class TokenizeKIInputs(DataTransformFn):
         subtask = data.pop("subtask", None)
         actions = data.get("actions", None)
 
+        # Debug: print subtask and prompt
+        print(f"[TokenizeKIInputs] prompt: {prompt[:80] if len(prompt) > 80 else prompt}")
+        print(f"[TokenizeKIInputs] subtask: {subtask[:80] if subtask and len(str(subtask)) > 80 else subtask}")
+
         if subtask is not None:
             # Main prompt uses subtask text (conditioning on subtask for action expert)
             tokens, token_masks = self.paligemma_tokenizer.tokenize(subtask, state)

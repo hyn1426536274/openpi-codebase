@@ -229,6 +229,31 @@ class DataConfigFactory(abc.ABC):
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+
+        # Fallback: try loading from lerobot v3 format meta/stats.json
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        if repo_id is not None:
+            lerobot_stats_path = pathlib.Path(repo_id) / "meta" / "stats.json"
+            if lerobot_stats_path.exists():
+                try:
+                    import json
+                    import numpy as np
+                    with open(lerobot_stats_path) as f:
+                        raw = json.load(f)
+                    norm_stats = {}
+                    for key, vals in raw.items():
+                        if "mean" in vals and "std" in vals:
+                            norm_stats[key] = _normalize.NormStats(
+                                mean=np.array(vals["mean"], dtype=np.float32),
+                                std=np.array(vals["std"], dtype=np.float32),
+                                q01=np.array(vals["q01"], dtype=np.float32) if "q01" in vals else None,
+                                q99=np.array(vals["q99"], dtype=np.float32) if "q99" in vals else None,
+                            )
+                    logging.info(f"Loaded norm stats from lerobot format: {lerobot_stats_path}")
+                    return norm_stats
+                except Exception as e:
+                    logging.warning(f"Failed to load lerobot norm stats from {lerobot_stats_path}: {e}")
+
         return None
 
 
@@ -330,18 +355,18 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
+        repack_mapping = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if getattr(model_config, "pi05_ki", False):
+            repack_mapping["subtask"] = "subtask"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_mapping)]
         )
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
@@ -386,6 +411,57 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoSubtaskDataConfig(DataConfigFactory):
+    """Config for LIBERO subtask datasets in LeRobot v3.0 format (e.g. libero_10_subtasks_fixed).
+
+    Subtask datasets use different key names than standard LeRobot v2:
+      - images: images.agentview_rgb, images.wrist_rgb (not observation/image)
+      - state: state (not observation/state)
+      - actions: actions (same)
+      - subtask: subtask (string field, directly in each frame)
+      - overall_task: overall_task (string field)
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_mapping = {
+            "observation/image": "images.agentview_rgb",
+            "observation/wrist_image": "images.wrist_rgb",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if getattr(model_config, "pi05_ki", False):
+            repack_mapping["subtask"] = "subtask"
+
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_mapping)]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -548,6 +624,18 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+
+    # Train/Val split for monitoring overfitting without simulation.
+    # val_ratio=0 disables validation (default, preserves existing behavior).
+    val_ratio: float = 0.0
+    # How often (in steps) to run validation. Only used when val_ratio > 0.
+    val_interval: int = 500
+    # Number of batches per validation run. Only used when val_ratio > 0.
+    val_batches: int = 10
+
+    # Debug: limit number of episodes loaded. None = load all (default).
+    # Set to a small number (e.g. 5) for quick pipeline verification.
+    debug_episodes: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -798,11 +886,11 @@ _CONFIGS = [
         project_name="pi05_research", # in entity:huangyinuo321-uestc
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="/root/Training/ki/data/libero/datasets_lerobot", # /root/Training/ki/data/libero/datasets_lerobot
+            repo_id="/workspace/data/libero/lerobot",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=32*8,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -814,41 +902,79 @@ _CONFIGS = [
         # log_interval=100, # default
         # save_interval=1000, # default
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/root/Models/pi05_base_pytorch",
-        checkpoint_base_dir="/root/Training/ki/outputs/models/ckpts-torch",
+        pytorch_weight_path="/workspace/data/pi_models/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
         # assets_base_dir="/root/Training/ki/data/libero",
         num_train_steps=30_000,
-        num_workers=16,
+        num_workers=4,
+        # 快速管道验证：仅加载 5 个 episode（验证通过后设为 None）
+        debug_episodes=50,
     ),
+    # pi05_libero_torch_debug 的 val_test 版本，仅新增 val 参数 + 少量步数用于验证 train/val 功能
     TrainConfig(
-        name="pi05_ki_libero_torch_debug",  # PI05_KI (knowledge isolation) torch debug config
-        project_name="pi05_ki_research",
-        model=pi0_config.Pi0Config(
-            pi05_ki=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        pytorch_training_precision="float32",
+        name="pi05_libero_val_test",
+        project_name="pi05_research", # in entity:huangyinuo321-uestc
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="/root/Training/ki/data/libero/datasets_lerobot",
+            repo_id="/workspace/data/libero/lerobot",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=2,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=50_000,
-            decay_lr=2.5e-6,
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
-        freeze_filter=pi0_config.Pi0Config(pi05_ki=True, action_horizon=10).get_freeze_filter(),
-        pytorch_weight_path="/root/Models/pi05_base_pytorch",
-        checkpoint_base_dir="/root/Training/ki/outputs/models/ckpts-torch-ki",
+        ema_decay=0.999,
+        pytorch_weight_path="/workspace/data/pi_models/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
         num_train_steps=50_000,
         num_workers=4,
+        # test log
+        log_interval=50,
+        # 仅以下 3 行是新增的 val 参数
+        val_ratio=0.1,
+        val_interval=50,
+        val_batches=2,
+        # 快速管道验证：仅加载 5 个 episode（验证通过后设为 None）
+        debug_episodes=None,
+    ),
+    TrainConfig(
+        name="pi05_ki_libero_torch_debug",
+        project_name="pi05_research",
+        model=pi0_config.Pi0Config(
+            pi05_ki=True,
+            action_horizon=10,
+            fast_model_tokenizer_kwargs={"fast_tokenizer_path": "/workspace/data/pi_models/fast-action-tokenizer"},
+        ),
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path="/workspace/data/pi_models/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
+        num_train_steps=30_000,
+        num_workers=4,
+        # debug_episodes=50,
+        # test log
+        log_interval=50,
+        # 仅以下 3 行是新增的 val 参数
+        val_ratio=0.1,
+        val_interval=50,
+        val_batches=2,
     ),
     #
     # Fine-tuning Aloha configs.

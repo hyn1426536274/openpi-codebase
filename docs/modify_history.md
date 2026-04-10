@@ -6,6 +6,73 @@
 
 ---
 
+## ⭐ 最新进展（2026-04-10）
+
+**代码质量改进 + Device mismatch 修复 + 命名规范化**
+
+核心改进：
+- ✅ **类名重命名**：`LeRobotLiberoV3DataConfig` → `LeRobotLiberoSubtaskDataConfig`（`config.py`），名称更准确地反映其用途（subtask 数据集配置），而非仅与 v3 格式绑定
+- ✅ **Device mismatch 修复**（`pi0_pytorch.py`）：`_prepare_attention_masks_4d()` 中 `torch.zeros` / `torch.full` 默认创建 CPU tensor，但输入 `att_2d_masks_4d` 在 CUDA 上，导致 `RuntimeError: Expected all tensors on same device`。修复：提取 `device = att_2d_masks_4d.device` 并传入 tensor 创建函数
+- ✅ **Train/Val split 完整性验证**（`data_loader.py`）：在 `create_torch_data_loader_with_val()` 中新增 4 条 assert 检查——episode 不重叠、episode 不遗漏、frame 不重叠、frame 不遗漏
+- ✅ **参数命名统一**：`debug_episodes` → `episodes`，涉及 `data_loader.py` 的 `create_data_loader()` 和 `create_torch_data_loader_with_val()`，以及 `train_pytorch.py` 的调用点。新名称更通用，不暗示仅用于调试
+
+**文件变更清单**：
+
+| 文件 | 改动 |
+|------|------|
+| `src/openpi/training/config.py` | 类名 `LeRobotLiberoV3DataConfig` → `LeRobotLiberoSubtaskDataConfig`，含引用更新 |
+| `src/openpi/models_pytorch/pi0_pytorch.py` | `_prepare_attention_masks_4d()` 添加 `device=` 参数，修复 CUDA/CPU 混合报错 |
+| `src/openpi/training/data_loader.py` | `create_data_loader()` 和 `create_torch_data_loader_with_val()` 参数 `debug_episodes` → `episodes`；新增 train/val split 的 4 条 assert |
+| `scripts/train_pytorch.py` | 调用 `episodes=debug_eps`（对齐参数重命名） |
+
+---
+
+## ⭐ 进展（2026-04-09 v2）
+
+**正式迁移到 lerobot 0.4.4 + LeRobot v3.0 数据集支持**
+
+核心改进：
+- ✅ `pyproject.toml` 锁定 `lerobot==0.4.4`（从 PyPI 安装，不再用 git rev），解决 `uv run` 反复降级问题
+- ✅ `data_loader.py` 导入路径：`lerobot.datasets.lerobot_dataset`（0.4.4 移除了 `lerobot.common`）
+- ✅ `data_loader.py` 的 `PromptFromLeRobotTask` 兼容：0.4.4 的 `meta.tasks` 是 DataFrame，自动转换为 `dict[int, str]`
+- ✅ `data_loader.py` 的 `episode_data_index` 重建：使用 `meta.episodes` 的 `dataset_from_index/dataset_to_index` 列（0.4.4 移除了 `episode_data_index` 属性）
+- ✅ `config.py` 新增 `LeRobotLiberoSubtaskDataConfig`（原名 `LeRobotLiberoV3DataConfig`）：subtask 数据集 key 映射（`images.agentview_rgb` → `image`，`images.wrist_rgb` → `wrist_image`）
+- ✅ `config.py` 的 `pi05_ki_libero_torch_debug` 配置改用 `LeRobotLiberoSubtaskDataConfig`
+- ✅ `config.py` 的 `_load_norm_stats()` fallback：自动从 `meta/stats.json` 加载归一化统计
+- ✅ 原有 `LeRobotLiberoDataConfig`（v2 key 映射）保持不变，兼容 `/workspace/data/libero/lerobot` 等 v2 数据集
+
+**lerobot 0.4.4 vs 0.1.0 关键 API 差异**：
+
+| 项目 | lerobot 0.1.0 | lerobot 0.4.4 |
+|------|--------------|---------------|
+| 导入路径 | `lerobot.common.datasets.lerobot_dataset` | `lerobot.datasets.lerobot_dataset` |
+| `meta.tasks` 类型 | `dict[int, str]` | `pandas.DataFrame` |
+| tasks 文件 | `meta/tasks.jsonl` | `meta/tasks.parquet` |
+| episode 边界 | `dataset.episode_data_index` | `meta.episodes[dataset_from_index/dataset_to_index]` |
+| `__getitem__` | 不注入 task/subtask | 自动注入 `task` 和 `subtask` 字段 |
+
+**快速开始**：
+```bash
+uv run scripts/train_pytorch.py pi05_ki_libero_torch_debug --exp_name my_run
+```
+
+详见 [8.4 实现更新](#84--2026-04-09-lerobot-v30-兼容性修复)
+
+---
+
+## ⭐ 进展（2026-04-08）
+
+**PI05_KI 真实 Subtask 数据管道已实装**
+
+核心改进：
+- ✅ 实现 `_EnsureSubtask` 类，支持**三层优先级**处理 subtask 来源
+- ✅ 新增 `pi05_ki_libero_torch_debug` 训练配置，指向 `/workspace/data/libero/libero_10_subtasks_fixed`
+- ✅ 支持多种数据集格式：直接字段 → 索引映射 → 伪标注回退
+
+详见 [8.3 实现更新](#83--2026-04-08-实现更新真实-subtask-数据支持)
+
+---
+
 ## 目录
 
 1. [全局概览](#1-全局概览)
@@ -755,6 +822,157 @@ class SubtaskFromAnnotation(DataTransformFn):
 
 暂时建议先用**方案 A**，后续升级到方案 B。
 
+#### 8.3 ⭐ 2026-04-08 实现更新：真实 Subtask 数据支持
+
+实现已升级为支持**真实 subtask 标注**的数据集（如 LeRobot v3 格式的 `libero_10_subtasks_fixed`）。
+
+**变更**：
+- 移除 `_SubtaskFromPrompt`，替换为更鲁棒的 `_EnsureSubtask` 类
+- `_EnsureSubtask` 支持三层优先级：
+  1. **直接字段**：优先使用数据中已存在的 `subtask` 字符串字段（真实标注）
+  2. **索引映射**：若无直接字段，尝试通过 `subtask_index` 查询 `meta/subtasks.json` 映射
+  3. **伪标注回退**：若上述都无，使用 `prompt` 作为伪 subtask（向后兼容）
+
+```python
+class _EnsureSubtask:
+    """Ensures 'subtask' field exists, preserving real annotations when present."""
+    
+    def __init__(self, subtasks_mapping: dict[int, str] | None = None):
+        self._subtasks_mapping = subtasks_mapping
+    
+    def __call__(self, data: dict) -> dict:
+        # 优先级 1：已有 subtask 字段 → 保留
+        if data.get("subtask") is not None:
+            return data
+        
+        # 优先级 2：索引映射（若有）
+        if self._subtasks_mapping is not None and "subtask_index" in data:
+            idx = int(data["subtask_index"])
+            if idx in self._subtasks_mapping:
+                data["subtask"] = self._subtasks_mapping[idx]
+                return data
+        
+        # 优先级 3：回退到 prompt
+        data["subtask"] = data.get("prompt", "")
+        return data
+```
+
+**新增配置**：`LeRobotLiberoSubtaskDataConfig`
+- 处理 LeRobot v3 key 命名（`observation.images.image` → `image`）
+- 支持 `action_sequence_keys=("action",)`（v3 使用 `action` 而非 `actions`）
+- 自动检测数据中的 subtask 字段（无需外部 annotation 文件）
+
+**新增训练配置**：`pi05_ki_libero_torch_debug`
+```python
+TrainConfig(
+    name="pi05_ki_libero_torch_debug",
+    model=Pi0Config(pi05_ki=True, action_horizon=10),
+    data=LeRobotLiberoSubtaskDataConfig(
+        repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+        base_config=DataConfig(prompt_from_task=True),
+    ),
+    # ... 其他参数同 pi05_libero_torch_debug
+)
+```
+
+**数据流**：
+```
+libero_10_subtasks_fixed (LeRobot v3, 含 subtask 字符串字段)
+  ↓
+LeRobotDataset (自动加载 subtask 字段)
+  ↓
+PromptFromLeRobotTask (添加 prompt)
+  ↓
+_EnsureSubtask (检查 → 保留 → 不做任何改动)
+  ↓
+RepackTransform (v3 key 映射)
+  ↓
+LiberoInputs / TokenizeKIInputs / forward() → 三路 loss
+```
+
+**迁移指南**：
+- 已有真实 subtask 标注的数据集：直接使用 `_EnsureSubtask`，无需额外配置
+- 仅有 `subtask_index` 的数据集：提供 `meta/subtasks.json` 映射文件，`_load_subtasks_mapping()` 自动加载
+- 无 subtask 标注的数据集：自动回退到 prompt-based pseudo-subtask，行为同原 `_SubtaskFromPrompt`
+
+#### 8.4 ⭐ 2026-04-09 LeRobot v3.0 兼容性修复（正式迁移到 lerobot 0.4.4）
+
+**问题背景**：原始 openpi 使用 `lerobot==0.1.0`（通过 git rev 锁定），只支持 v2.1 格式数据集。现在需要支持 v3.0 格式的 `libero_10_subtasks_fixed` 数据集。
+
+**变更 1：`pyproject.toml` — 锁定 lerobot 0.4.4**
+
+```toml
+# 旧
+dependencies = ["lerobot", ...]
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864..." }
+
+# 新
+dependencies = ["lerobot==0.4.4", ...]
+# [tool.uv.sources] 中移除 lerobot 的 git 源
+```
+
+效果：`uv run` 不再降级 lerobot，从 PyPI 安装稳定版本。
+
+**变更 2：`data_loader.py` — lerobot 导入路径更新**
+
+```python
+# 旧（lerobot 0.1.0）
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+
+# 新（lerobot 0.4.4，lerobot.common 已移除）
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
+```
+
+**变更 3：`data_loader.py` — `PromptFromLeRobotTask` 兼容 DataFrame**
+
+lerobot 0.4.4 的 `meta.tasks` 返回 `pandas.DataFrame`（index=task text, column=task_index），不再是 `dict[int, str]`。
+
+```python
+# 自动转换 DataFrame → dict[int, str]
+tasks = dataset_meta.tasks
+if hasattr(tasks, "iterrows"):
+    tasks_dict = {int(row["task_index"]): str(idx) for idx, row in tasks.iterrows()}
+else:
+    tasks_dict = tasks  # lerobot <= 0.1.0 兼容
+```
+
+**变更 4：`data_loader.py` — episode_data_index 重建**
+
+lerobot 0.4.4 移除了 `LeRobotDataset.episode_data_index` 属性。改用 `meta.episodes` 的 `dataset_from_index` / `dataset_to_index` 列：
+
+```python
+if hasattr(raw_ds, "episode_data_index"):
+    # lerobot <= 0.1.0
+    episode_data_index = raw_ds.episode_data_index
+elif hasattr(raw_ds, "meta") and raw_ds.meta.episodes is not None:
+    # lerobot >= 0.4.4
+    episodes_table = raw_ds.meta.episodes
+    episode_data_index = {
+        "from": torch.tensor(episodes_table["dataset_from_index"]),
+        "to": torch.tensor(episodes_table["dataset_to_index"]),
+    }
+```
+
+**变更 5：`config.py` — 新增 `LeRobotLiberoSubtaskDataConfig`（原名 `LeRobotLiberoV3DataConfig`）**
+
+v3 数据集 `libero_10_subtasks_fixed` 的 feature key 与 `lerobot` 数据集不同，需要独立的 RepackTransform。
+
+注意：`RepackTransform` 的 dict 中，**key = 目标 key（LiberoInputs 期望的）**，**value = 源 key（数据集中的）**。
+
+| 配置 | 数据集源 key | RepackTransform 目标 key |
+|---|---|---|
+| `LeRobotLiberoDataConfig` (lerobot) | `image`, `wrist_image`, `state` | `observation/image`, `observation/wrist_image`, `observation/state` |
+| `LeRobotLiberoSubtaskDataConfig` (subtask) | `images.agentview_rgb`, `images.wrist_rgb`, `state` | `observation/image`, `observation/wrist_image`, `observation/state` |
+
+`pi05_ki_libero_torch_debug` 配置改用 `LeRobotLiberoSubtaskDataConfig`。
+原有 `LeRobotLiberoDataConfig` 保持不变，兼容 `/workspace/data/libero/lerobot` 数据集。
+
+**变更 6：`config.py` — norm stats fallback**
+
+`_load_norm_stats()` 在找不到 openpi 标准格式时，自动从 `{repo_id}/meta/stats.json` 加载。
+注意：openpi 只归一化 `state` 和 `actions`，图像不参与归一化，所以 v3 stats.json 中的图像 key 不匹配不影响训练。
+
 ---
 
 ## 9. Policy 推理层
@@ -907,11 +1125,12 @@ python test-scripts/merge_lora.py \
 | `src/openpi/models_pytorch/pi0_pytorch.py` | `__init__` 支持 pi05_ki；`forward()` 返回多路 loss dict；新增 `forward_language_model()` | 全部 | P0 | ✅ 已完成（LoRA 留 P2） |
 | `src/openpi/models/tokenizer.py` | 新增 SubtaskTokenizer | Subtask | P0 | ✅ 已完成 |
 | `src/openpi/transforms.py` | 新增 TokenizeKIInputs, ExtractSubtaskOutput | PI05_KI, FAST, Subtask | P0 | ✅ 已完成 |
-| `src/openpi/training/config.py` | ModelTransformFactory 新增 PI05_KI 分支 + LIBERO KI 训练配置 | 全部 | P0 | ✅ 已完成 |
-| `src/openpi/training/data_loader.py` | SubtaskFromAnnotation，subtask 字段注入 | Subtask, 数据 | P1 | ✅ 已完成（pseudo-subtask，方案 A） |
-| `src/openpi/policies/policy.py` | PI05_KI 推理, generate_subtask | Subtask | P1 | ⬜ 未完成 |
+| `src/openpi/training/config.py` | ModelTransformFactory 新增 PI05_KI 分支；新增 LeRobotLiberoSubtaskDataConfig (subtask 数据集 key 映射)；pi05_ki_libero_torch_debug 改用 Subtask config；_load_norm_stats fallback | 全部 | P0-P1 | ✅ 已完成 |
+| `src/openpi/training/data_loader.py` | 导入路径迁移；PromptFromLeRobotTask 兼容 DataFrame；episode_data_index 从 meta.episodes 重建；_EnsureSubtask | Subtask, 兼容性 | P1 | ✅ 已完成 |
+| `pyproject.toml` | lerobot 从 git rev 改为 `==0.4.4`（PyPI） | 兼容性 | P0 | ✅ 已完成 |
+| `src/openpi/policies/policy.py` | PI05_KI 推理, generate_subtask | Subtask | P1 | ✅ 已完成 |
 | `src/openpi/policies/libero_policy.py` | LiberoInputs 支持 PI05_KI | LIBERO | P1 | ✅ 已完成 |
-| `scripts/train_pytorch.py` | 多路损失合并, 分别记录 wandb | 全部 | P1 | ✅ 已完成 |
+| `scripts/train_pytorch.py` | 多路损失合并, 分别记录 wandb；新增验证支持 | 全部 | P1 | ✅ 已完成 |
 | `test-scripts/merge_lora.py` | 新建（从 comet-test 移植） | LoRA | P2 | ⬜ 未完成 |
 | `src/openpi/models_pytorch/preprocessing_pytorch.py` | 轻微调整（对齐 comet-test） | 通用 | P2 | ⬜ 未完成 |
 
@@ -947,9 +1166,18 @@ python test-scripts/merge_lora.py \
 ### Phase 4：训练脚本与推理（P1，约 1 天）
 
 11. ✅ `train_pytorch.py`：多路 loss 合并 + wandb 分别记录 `loss/action`、`loss/subtask`、`loss/fast`
-12. `policy.py`：PI05_KI 推理 + subtask 注入
+12. ✅ `policy.py`：PI05_KI 推理 + subtask 生成（`generate_subtask()`）
+13. ✅ `pi0_pytorch.py`：模型侧 `generate_subtask()` 自回归解码实现
 
 **验证**：运行 `pi05_ki_libero` 配置 100 步，确认三路 loss 均在下降。
+
+### Phase 4.5：Train/Val Split（P1）
+
+14. ✅ `training/config.py`：TrainConfig 新增 `val_ratio` / `val_interval` / `val_batches`
+15. ✅ `training/data_loader.py`：`_split_episodes()` + `create_torch_data_loader_with_val()` + `create_torch_dataset(episodes=)`
+16. ✅ `train_pytorch.py`：`validate()` 函数 + 训练循环中定期验证 + wandb 记录 `val_loss/*`
+
+**验证**：设置 `val_ratio=0.1`，确认 wandb 出现 `val_loss/action` 等指标；设置 `val_ratio=0` 确认行为与原来一致。
 
 ### Phase 5：LoRA 与工具（P2，可后续进行）
 

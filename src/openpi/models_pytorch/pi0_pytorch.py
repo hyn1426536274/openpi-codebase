@@ -2,6 +2,7 @@ import logging
 import math
 from collections import defaultdict
 
+import sentencepiece
 import torch
 from torch import Tensor
 from torch import nn
@@ -10,6 +11,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+import openpi.shared.download as _download
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -89,6 +91,13 @@ class PI0Pytorch(nn.Module):
         self.pi05 = config.pi05 or config.pi05_ki
         self.pi05_ki = config.pi05_ki
 
+        # Load sentencepiece tokenizer for subtask generation (PI05_KI inference)
+        if self.pi05_ki:
+            sp_path = _download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+            with sp_path.open("rb") as f:
+                self._sp_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+            self._eos_token_id = self._sp_tokenizer.eos_id()
+
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
@@ -159,7 +168,10 @@ class PI0Pytorch(nn.Module):
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        # Infer dtype from model weights so the mask matches query dtype (required by SDPA).
+        dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        device = att_2d_masks_4d.device
+        return torch.where(att_2d_masks_4d, torch.zeros(1, dtype=dtype, device=device), torch.full((1,), -2.3819763e38, dtype=dtype, device=device))
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -366,6 +378,8 @@ class PI0Pytorch(nn.Module):
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, knowledge_isolation):
+            # Ensure mask dtype matches embeddings (gradient checkpointing may recompute in float32)
+            att_2d_masks_4d = att_2d_masks_4d.to(dtype=prefix_embs.dtype)
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -444,6 +458,8 @@ class PI0Pytorch(nn.Module):
         fast_att_2d_masks_4d  = self._prepare_attention_masks_4d(fast_att_2d_masks)
 
         def forward_func(prefix_embs, att_2d_masks_4d, position_ids):
+            # Ensure mask dtype matches embeddings (gradient checkpointing may recompute in float32)
+            att_2d_masks_4d = att_2d_masks_4d.to(dtype=prefix_embs.dtype)
             (prefix_out, _), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -573,3 +589,178 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    # ------------------------------------------------------------------
+    # Subtask generation (PI05_KI inference)
+    # ------------------------------------------------------------------
+
+    def _build_subtask_prefix_tokens(self, observation) -> list[list[int]]:
+        """Build the subtask generation prefix token sequences from the current observation.
+
+        Uses the same format as SubtaskTokenizer:
+            [BOS] "Task: {prompt}, State: {state_str};\\nSubtask: "
+
+        Returns a list (one per batch element) of token-id lists.
+        """
+        import numpy as np
+
+        # Decode the main prompt from tokenized_prompt (recover text from token ids)
+        tokenized = observation.tokenized_prompt  # [B, L]
+        prompt_masks = observation.tokenized_prompt_mask  # [B, L]
+        states = observation.state  # [B, S]
+
+        batch_size = tokenized.shape[0]
+        all_prefix_tokens = []
+
+        for b in range(batch_size):
+            mask = prompt_masks[b]
+            if isinstance(mask, torch.Tensor):
+                valid_len = int(mask.sum().item())
+                token_ids = tokenized[b, :valid_len].cpu().tolist()
+            else:
+                valid_len = int(np.sum(mask))
+                token_ids = tokenized[b, :valid_len].tolist()
+
+            # Decode the original prompt text from PaliGemma tokens
+            # The tokenized_prompt contains "Task: {text}, State: {state};\\nAction: "
+            # We need to extract just the task text portion
+            raw_text = self._sp_tokenizer.decode(token_ids)
+
+            # Extract task description from the decoded text
+            task_text = raw_text
+            if "Task:" in raw_text:
+                task_text = raw_text.split("Task:")[1]
+                if ", State:" in task_text:
+                    task_text = task_text.split(", State:")[0]
+                task_text = task_text.strip()
+
+            # Rebuild state string from observation.state
+            state_np = states[b].detach().cpu().float().numpy() if isinstance(states[b], torch.Tensor) else states[b]
+            discretized = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized))
+
+            # Build prefix: same format as SubtaskTokenizer
+            prefix = f"Task: {task_text}, State: {state_str};\nSubtask: "
+            prefix_tokens = self._sp_tokenizer.encode(prefix, add_bos=True)
+            all_prefix_tokens.append(prefix_tokens)
+
+        return all_prefix_tokens
+
+    @torch.no_grad()
+    def generate_subtask(
+        self,
+        device: str | torch.device,
+        observation,
+        max_new_tokens: int = 30,
+    ) -> list[str]:
+        """Generate subtask descriptions autoregressively from the current observation.
+
+        Uses only the PaliGemma backbone (no action expert). Steps:
+          1. Embed images + subtask-prefix tokens  →  compute KV cache
+          2. Autoregressively decode token-by-token until EOS or max_new_tokens
+          3. Decode generated token ids back to text
+
+        Args:
+            device: torch device.
+            observation: Observation dataclass (batched, B=1 typical at inference).
+            max_new_tokens: maximum number of new tokens to generate.
+
+        Returns:
+            List of decoded subtask strings, one per batch element.
+        """
+        images, img_masks, _, _, _ = self._preprocess_observation(observation, train=False)
+
+        # Build per-sample prefix token sequences
+        prefix_token_lists = self._build_subtask_prefix_tokens(observation)
+        batch_size = len(prefix_token_lists)
+
+        # Pad to same length across batch
+        max_prefix_len = max(len(t) for t in prefix_token_lists)
+        padded_tokens = torch.zeros(batch_size, max_prefix_len, dtype=torch.long, device=device)
+        padded_masks = torch.zeros(batch_size, max_prefix_len, dtype=torch.bool, device=device)
+        for b, toks in enumerate(prefix_token_lists):
+            padded_tokens[b, : len(toks)] = torch.tensor(toks, dtype=torch.long, device=device)
+            padded_masks[b, : len(toks)] = True
+
+        # Embed prefix: images + subtask-prefix language tokens
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, padded_tokens, padded_masks
+        )
+        if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # Forward through backbone to get KV cache + last hidden state
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # Get logits for the last prefix token → first generated token
+        last_hidden = prefix_out[:, -1:, :]  # [B, 1, D]
+        logits = self.paligemma_with_expert.paligemma.lm_head(last_hidden)  # [B, 1, V]
+        next_token = logits[:, -1, :].argmax(dim=-1)  # [B]
+
+        # Autoregressive decoding
+        generated_tokens = [next_token.unsqueeze(1)]  # list of [B, 1]
+        finished = next_token == self._eos_token_id  # [B]
+
+        prefix_len = prefix_pad_masks.shape[1]
+
+        for step in range(1, max_new_tokens):
+            if finished.all():
+                break
+
+            # Embed the new token
+            new_token_emb = self.paligemma_with_expert.embed_language_tokens(next_token.unsqueeze(1))
+            emb_dim = new_token_emb.shape[-1]
+            new_token_emb = new_token_emb * math.sqrt(emb_dim)
+            if prefix_embs.dtype == torch.bfloat16:
+                new_token_emb = new_token_emb.to(dtype=torch.bfloat16)
+
+            # Position ids for the new token
+            new_position_ids = torch.full(
+                (batch_size, 1), prefix_len + step - 1, dtype=torch.long, device=device
+            )
+
+            # Attention mask: new token attends to all cached tokens + itself
+            cache_len = prefix_len + step  # total tokens so far (including this one)
+            new_att_mask = torch.zeros(batch_size, 1, 1, cache_len, device=device)
+
+            # Forward through backbone with KV cache
+            (new_out, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=new_att_mask,
+                position_ids=new_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[new_token_emb, None],
+                use_cache=True,
+            )
+
+            logits = self.paligemma_with_expert.paligemma.lm_head(new_out)  # [B, 1, V]
+            next_token = logits[:, -1, :].argmax(dim=-1)  # [B]
+
+            # Mask out finished sequences (replace with EOS)
+            next_token = torch.where(finished, self._eos_token_id, next_token)
+            generated_tokens.append(next_token.unsqueeze(1))
+            finished = finished | (next_token == self._eos_token_id)
+
+        # Decode generated tokens to strings
+        all_gen_tokens = torch.cat(generated_tokens, dim=1)  # [B, gen_len]
+        results = []
+        for b in range(batch_size):
+            token_ids = all_gen_tokens[b].cpu().tolist()
+            # Truncate at EOS
+            if self._eos_token_id in token_ids:
+                token_ids = token_ids[: token_ids.index(self._eos_token_id)]
+            text = self._sp_tokenizer.decode(token_ids)
+            results.append(text)
+
+        return results
