@@ -15,8 +15,9 @@
 6. [LoRA 支持与 Merge 工具](#6-lora-支持与-merge-工具)
 7. [评测与指标体系](#7-评测与指标体系)
 8. [训练过程验证：Train/Val Split](#8-训练过程验证trainval-split)
-9. [已知技术债务](#9-已知技术债务)
-10. [实施优先级总览](#10-实施优先级总览)
+9. [按 Task 加载数据](#9-按-task-加载数据)
+10. [已知技术债务](#10-已知技术债务)
+11. [实施优先级总览](#11-实施优先级总览)
 
 ---
 
@@ -575,7 +576,240 @@ pi05_ki_libero_flow_only  val_loss/action = 0.031  ← 仅 flow matching
 
 ---
 
-## 9. 已知技术债务
+## 9. 按 Task 加载数据
+
+### 动机
+
+LIBERO 数据集包含多个 task（如 `libero_10` 有 10 个 task，`libero_90` 有 90 个）。当前数据加载只支持按 episode index 过滤（`episodes` 参数），无法按 task 语义选择训练数据。
+
+**使用场景**：
+- **聚焦训练**：只训练某几个 task（如只训练 "put the mug on the plate" 相关的 episodes）
+- **消融对比**：在相同 task 子集上对比不同方法的效果
+- **难度分层**：按 task 难度（simple / medium / long）分组训练
+- **泛化实验**：在 N 个 task 上训练，在剩余 task 上测试
+
+### 现状
+
+```
+数据层级关系（LIBERO LeRobot v3）：
+
+  meta/tasks.parquet
+    ├── task_name (str)  →  task_index (int)
+    └── 例如：40 个 task（libero_10 = 10 个 task）
+
+  meta/episodes/
+    ├── episode_index (int)
+    ├── tasks (array[str])     ← 该 episode 属于哪个 task
+    ├── dataset_from_index     ← 起始帧索引
+    └── dataset_to_index       ← 终止帧索引
+
+  data/ (每帧)
+    ├── task_index (int)       ← 该帧属于哪个 task
+    ├── episode_index (int)
+    └── frame_index (int)
+```
+
+当前 `create_torch_dataset()` 支持 `episodes: list[int] | None`，但没有 task 级过滤。
+
+### 参考实现（openpi-comet-test B1K）
+
+B1K 的做法是将 `tasks` 和 `episodes_index` 放在 **`DataConfig`** 中（而非 `TrainConfig`），这是正确的分层——**数据筛选是数据配置的关注点**：
+
+```python
+# openpi-comet-test 中的 B1K 配置
+data=LeRobotB1KDataConfig(
+    repo_id="behavior-1k/2025-challenge-demos",
+    base_config=DataConfig(
+        prompt_from_task=True,
+        episodes_index=list(range(200)),       # per-task 的 episode 索引
+        tasks=["turning_on_radio", "picking_up_trash", ...],  # 按 task 过滤
+        fine_grained_level=0,
+    ),
+),
+```
+
+B1K 中 `episodes_index` 是 **per-task** 的——每个 task 取前 N 个 episode，而非全局绝对索引。
+
+### 计划
+
+#### 9.1 DataConfig 层新增 task 过滤参数
+
+在 `DataConfig` 中新增，与 B1K 对齐：
+
+```python
+@dataclasses.dataclass(frozen=True)
+class DataConfig:
+    # 现有字段...
+    prompt_from_task: bool = False
+
+    # 新增：task 过滤
+    tasks: list[str] | None = None              # 按 task 名称过滤
+    episodes_index: list[int] | None = None     # per-task 的 episode 索引（每个 task 取这些索引的 episodes）
+```
+
+**设计说明**：
+- `tasks` 指定目标 task 名称列表，`None` 表示加载所有 task
+- `episodes_index` 是 **per-task** 索引——如 `episodes_index=[0,1,2]` 表示每个目标 task 取第 0/1/2 个 episode
+- 两者组合使用：先按 `tasks` 过滤，再在每个 task 内按 `episodes_index` 选取
+
+#### 9.2 Data loader 层实现 task → episodes 解析
+
+在 `data_loader.py` 的 `create_torch_dataset()` 中新增解析逻辑：
+
+```python
+def _resolve_task_episodes(
+    dataset_meta,
+    tasks: list[str] | None = None,
+    episodes_index: list[int] | None = None,
+) -> list[int] | None:
+    """将 task 名称 + per-task 索引解析为全局 episode 索引列表。
+
+    Args:
+        dataset_meta: LeRobotDatasetMetadata 实例
+        tasks: 目标 task 名称列表（None = 所有 task）
+        episodes_index: 每个 task 内要选取的 episode 索引（None = 全部）
+
+    Returns:
+        全局 episode 索引列表（sorted），或 None（不过滤）
+    """
+    if tasks is None and episodes_index is None:
+        return None
+
+    # 1. 构建 task_name → task_index 映射
+    meta_tasks = dataset_meta.tasks
+    if hasattr(meta_tasks, "iterrows"):
+        name_to_idx = {str(idx): int(row["task_index"]) for idx, row in meta_tasks.iterrows()}
+    else:
+        name_to_idx = {v: k for k, v in meta_tasks.items()}
+
+    # 2. 确定目标 task 集合
+    if tasks is not None:
+        target_task_indices = set()
+        for name in tasks:
+            if name in name_to_idx:
+                target_task_indices.add(name_to_idx[name])
+            else:
+                logging.warning(f"Task name not found in dataset: '{name}'")
+    else:
+        target_task_indices = set(name_to_idx.values())  # 所有 task
+
+    # 3. 按 task 分组 episodes
+    episodes_table = dataset_meta.episodes
+    eps_by_task: dict[int, list[int]] = defaultdict(list)
+    for _, row in episodes_table.iterrows():
+        ep_idx = int(row["episode_index"])
+        ep_tasks = row.get("tasks", [])
+        if isinstance(ep_tasks, str):
+            ep_tasks = [ep_tasks]
+        for t in ep_tasks:
+            task_idx = name_to_idx.get(str(t))
+            if task_idx in target_task_indices:
+                eps_by_task[task_idx].append(ep_idx)
+
+    # 4. 在每个 task 内按 episodes_index 选取
+    matched = []
+    for task_idx in sorted(eps_by_task):
+        task_eps = sorted(eps_by_task[task_idx])
+        if episodes_index is not None:
+            task_eps = [task_eps[i] for i in episodes_index if i < len(task_eps)]
+        matched.extend(task_eps)
+
+    logging.info(
+        f"Task filter: {len(target_task_indices)} tasks → {len(matched)} episodes"
+    )
+    return sorted(matched)
+```
+
+#### 9.3 与 train/val split 的兼容
+
+流程：**先按 task + episodes_index 过滤 → 再在过滤后的 episodes 上做 train/val split**
+
+```
+全部 episodes (500个, 10个task × 50个episode)
+    ↓ tasks=["task_a", "task_b", "task_c"], episodes_index=range(20)
+过滤后 episodes (60个, 3个task × 20个episode)
+    ↓ val_ratio=0.1
+train_episodes (54个) + val_episodes (6个)
+```
+
+在 `create_torch_data_loader_with_val()` 中，task 过滤发生在 split 之前：
+
+```python
+# Step 1: 解析 task 过滤
+task_eps = _resolve_task_episodes(
+    dataset_meta,
+    tasks=data_config.tasks,
+    episodes_index=data_config.episodes_index,
+)
+
+# Step 2: 合并其他 episode 过滤（如 debug_episodes）
+if task_eps is not None and episodes is not None:
+    final_episodes = sorted(set(task_eps) & set(episodes))
+elif task_eps is not None:
+    final_episodes = task_eps
+else:
+    final_episodes = episodes
+
+# Step 3: 创建数据集
+full_dataset = create_torch_dataset(..., episodes=final_episodes)
+
+# Step 4: 在过滤后的 episode 上做 train/val split
+train_eps, val_eps = _split_episodes(len(final_episodes), val_ratio, seed)
+```
+
+#### 9.4 使用示例
+
+```python
+# 示例 1：只训练 3 个 task，每个 task 取前 20 个 episode
+TrainConfig(
+    name="pi05_ki_libero_3tasks",
+    data=LeRobotLiberoSubtaskDataConfig(
+        repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            tasks=[
+                "pick up the black bowl on the cookie sheet and place it on the plate",
+                "pick up the alphabet soup and place it in the basket",
+                "put the white mug on the left plate",
+            ],
+            episodes_index=list(range(20)),  # 每个 task 取前 20 个 episode
+        ),
+    ),
+    val_ratio=0.1,
+    ...
+)
+
+# 示例 2：所有 task，但每个 task 只取前 10 个 episode（快速调试）
+TrainConfig(
+    name="pi05_ki_libero_quick",
+    data=LeRobotLiberoSubtaskDataConfig(
+        repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+        base_config=DataConfig(
+            prompt_from_task=True,
+            episodes_index=list(range(10)),  # 每个 task 取 10 个
+        ),
+    ),
+    ...
+)
+
+# 示例 3：训练集用 task A-H，验证集用 task I-J（跨 task 泛化测试）
+# 需要在 config 中定义两个独立配置
+```
+
+**涉及文件：**
+- `src/openpi/training/config.py` — `DataConfig` 新增 `tasks` / `episodes_index`
+- `src/openpi/training/data_loader.py` — 新增 `_resolve_task_episodes()`，修改 `create_torch_dataset()` 消费新参数
+- `scripts/train_pytorch.py` — `build_datasets()` 传递 task 参数（通过 `data_config` 透传，无需额外改动）
+
+**验证：**
+1. 指定 `tasks=["task_a"]`，确认只加载 task_a 的 episodes
+2. 指定 `tasks=["不存在的任务"]`，确认打印 warning 并加载全量数据
+3. 指定 `tasks=["task_a"]` + `episodes_index=[0,1]`，确认只加载 task_a 的前 2 个 episode
+4. 结合 `val_ratio>0`，确认 train/val 都只包含目标 task 的 episodes
+
+---
+
+## 10. 已知技术债务
 
 以下问题不阻塞消融实验，但应在后续解决：
 
@@ -590,13 +824,14 @@ pi05_ki_libero_flow_only  val_loss/action = 0.031  ← 仅 flow matching
 
 ---
 
-## 10. 实施优先级总览
+## 11. 实施优先级总览
 
 ### Phase A：消融实验基础（下一步优先）
 
 | 任务 | 涉及 | 状态 |
 |------|------|------|
 | **Train/Val Split + 训练中验证** | §8 | ⬜ |
+| **按 Task 加载数据** | §9 | ⬜ |
 | Pi0Config 消融开关 (`enable_fast_loss` / `enable_subtask_loss` / `enable_ki_attention`) | §1, §5 | ⬜ |
 | Loss 权重可配置化 | §2 | ⬜ |
 | 消融配置组合生成 | §1.1 | ⬜ |
@@ -628,4 +863,4 @@ pi05_ki_libero_flow_only  val_loss/action = 0.031  ← 仅 flow matching
 
 ---
 
-*最后更新：2025-07-06*
+*最后更新：2026-04-11*

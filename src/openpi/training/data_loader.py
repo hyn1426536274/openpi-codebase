@@ -1,3 +1,4 @@
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 import json
 import logging
@@ -218,27 +219,114 @@ def _load_subtasks_mapping(repo_id: str) -> dict[int, str] | None:
     return None
 
 
-def _split_episodes(total_episodes: int, val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
+def _split_episodes(episode_ids: list[int], val_ratio: float, seed: int) -> tuple[list[int], list[int]]:
     """Split episode indices into train/val sets.
 
     Deterministic given the same seed, so all ablation variants share
     the same val episodes for fair comparison.
 
+    Args:
+        episode_ids: List of episode indices to split (may be non-contiguous).
+
     Returns:
         (train_episode_ids, val_episode_ids)
     """
-    all_ids = list(range(total_episodes))
+    all_ids = list(episode_ids)
     rng = np.random.RandomState(seed)
     rng.shuffle(all_ids)
-    val_count = max(1, int(total_episodes * val_ratio))
+    val_count = max(1, int(len(all_ids) * val_ratio))
     return sorted(all_ids[val_count:]), sorted(all_ids[:val_count])
+
+
+def _resolve_task_episodes(
+    dataset_meta,
+    tasks: Sequence[str] | None = None,
+    episodes_index: Sequence[int] | None = None,
+) -> list[int] | None:
+    """Resolve task names + per-task episode indices to global episode indices.
+
+    Args:
+        dataset_meta: LeRobotDatasetMetadata instance.
+        tasks: Target task names (None = all tasks).
+        episodes_index: Per-task episode positions to keep (e.g. [0,1,2] = first 3 episodes
+            of each task). None = all episodes within matched tasks.
+
+    Returns:
+        Sorted list of global episode indices, or None if no filtering is needed.
+    """
+    if tasks is None and episodes_index is None:
+        return None
+
+    # 1. Build task_name → task_index mapping from meta.tasks
+    meta_tasks = dataset_meta.tasks
+    if hasattr(meta_tasks, "iterrows"):
+        # lerobot >= 0.4.4: DataFrame (index=task_text, column=task_index)
+        name_to_idx: dict[str, int] = {str(idx): int(row["task_index"]) for idx, row in meta_tasks.iterrows()}
+    else:
+        # lerobot <= 0.1.0: dict[int, str]
+        name_to_idx = {v: k for k, v in meta_tasks.items()}
+
+    # 2. Determine target task indices
+    if tasks is not None:
+        target_task_indices: set[int] = set()
+        for name in tasks:
+            if name in name_to_idx:
+                target_task_indices.add(name_to_idx[name])
+            else:
+                logging.warning(f"Task name not found in dataset: '{name}'")
+        if not target_task_indices:
+            logging.warning("No valid tasks matched. Loading all episodes.")
+            return None
+    else:
+        # No task filter — use all tasks (episodes_index still applies per-task)
+        target_task_indices = set(name_to_idx.values())
+
+    # 3. Group episodes by task using meta.episodes
+    episodes_table = dataset_meta.episodes
+    ep_indices_col = episodes_table["episode_index"]
+    ep_tasks_col = episodes_table["tasks"]
+    eps_by_task: dict[int, list[int]] = defaultdict(list)
+    for i in range(len(episodes_table)):
+        ep_idx = int(ep_indices_col[i])
+        ep_tasks = ep_tasks_col[i]
+        if isinstance(ep_tasks, str):
+            ep_tasks = [ep_tasks]
+        # ep_tasks is typically a list of task name strings
+        for t in ep_tasks:
+            task_idx = name_to_idx.get(str(t))
+            if task_idx is not None and task_idx in target_task_indices:
+                eps_by_task[task_idx].append(ep_idx)
+                break  # each episode belongs to one task
+
+    # 4. Per-task episode selection
+    matched: list[int] = []
+    for task_idx in sorted(eps_by_task):
+        task_eps = sorted(eps_by_task[task_idx])
+        if episodes_index is not None:
+            task_eps = [task_eps[i] for i in episodes_index if i < len(task_eps)]
+        matched.extend(task_eps)
+
+    logging.info(
+        f"Task filter: {len(target_task_indices)} tasks, "
+        f"{len(matched)} episodes selected"
+    )
+    print(
+        f"[TASK-FILTER] {len(target_task_indices)} tasks → {len(matched)} episodes "
+        f"(tasks={tasks}, episodes_index={episodes_index})",
+        flush=True,
+    )
+    return sorted(matched)
 
 
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig,
     episodes: list[int] | None = None,
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    Task-based filtering: if data_config.tasks or data_config.episodes_index is set,
+    resolves them to episode indices and merges with the `episodes` parameter.
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
@@ -250,6 +338,32 @@ def create_torch_dataset(
     print(f"[DATASET-DEBUG] Creating LeRobotDatasetMetadata(repo_id={repo_id})...", flush=True)
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     print(f"[DATASET-DEBUG] Metadata done in {_time.time()-_t0:.1f}s. fps={dataset_meta.fps}, total_episodes={dataset_meta.total_episodes}", flush=True)
+
+    # Task-based episode filtering: resolve tasks/episodes_index from DataConfig
+    task_episodes = _resolve_task_episodes(
+        dataset_meta,
+        tasks=data_config.tasks,
+        episodes_index=data_config.episodes_index,
+    )
+    # Merge with explicit `episodes` parameter (intersection if both present)
+    if task_episodes is not None and episodes is not None:
+        merged = sorted(set(task_episodes) & set(episodes))
+        print(
+            f"[TASK-FILTER] Merged task_episodes({len(task_episodes)}) ∩ episodes({len(episodes)}) "
+            f"→ {len(merged)} episodes",
+            flush=True,
+        )
+        episodes = merged
+    elif task_episodes is not None:
+        episodes = task_episodes
+
+    print(
+        f"[DATASET-DEBUG] Final episode filter: "
+        f"tasks={data_config.tasks}, episodes_index={data_config.episodes_index}, "
+        f"→ {len(episodes) if episodes is not None else 'ALL'} episodes"
+        + (f" {episodes}" if episodes is not None and len(episodes) <= 20 else ""),
+        flush=True,
+    )
 
     _t1 = _time.time()
     print(f"[DATASET-DEBUG] Creating LeRobotDataset(episodes={episodes})...", flush=True)
@@ -510,29 +624,46 @@ def create_torch_data_loader_with_val(
         raw_ds = raw_ds._dataset
 
     # Build episode_data_index compatible with both lerobot versions. （now use lerobot==0.4.4 for v3.0 dataset version）
+    # IMPORTANT: When episodes are filtered (task filter / debug_episodes), raw_ds.meta.episodes
+    # still contains ALL episodes from the full dataset. We must restrict to raw_ds.episodes
+    # (the actually loaded episodes) to avoid split/index mismatch.
     if hasattr(raw_ds, "episode_data_index"):
         # lerobot <= 0.1.0: has episode_data_index directly
         episode_data_index = raw_ds.episode_data_index
-        total_episodes = len(episode_data_index["from"])
+        loaded_episode_ids = list(range(len(episode_data_index["from"])))
     elif hasattr(raw_ds, "meta") and hasattr(raw_ds.meta, "episodes") and raw_ds.meta.episodes is not None:
-        # lerobot >= 0.4.4: use meta.episodes which has dataset_from_index / dataset_to_index
+        # lerobot >= 0.4.4: use meta.episodes
         episodes_table = raw_ds.meta.episodes
-        from_col = episodes_table["dataset_from_index"]
-        to_col = episodes_table["dataset_to_index"]
+        # Use the actually loaded episode list (may be a subset of meta.episodes).
+        # When episodes are filtered, meta.episodes still has ALL episodes, and its
+        # dataset_from_index / dataset_to_index reference the FULL dataset frame layout.
+        # But the filtered LeRobotDataset re-indexes frames from 0, so we must rebuild
+        # from/to based on per-episode `length` and the loaded episode order.
+        loaded_episode_ids = list(raw_ds.episodes) if hasattr(raw_ds, "episodes") and raw_ds.episodes is not None else list(range(len(episodes_table)))
+        length_col = episodes_table["length"]
+        # Build from/to mapping: ep_id -> (from_idx, to_idx) in the filtered dataset
+        ep_from = {}
+        ep_to = {}
+        cursor = 0
+        for ep_id in loaded_episode_ids:
+            ep_len = int(length_col[ep_id])
+            ep_from[ep_id] = cursor
+            ep_to[ep_id] = cursor + ep_len
+            cursor += ep_len
         episode_data_index = {
-            "from": torch.tensor(from_col, dtype=torch.int64),
-            "to": torch.tensor(to_col, dtype=torch.int64),
+            "ep_from": ep_from,
+            "ep_to": ep_to,
         }
-        total_episodes = len(from_col)
     else:
         raise RuntimeError(
             "Cannot determine episode boundaries: LeRobotDataset has neither "
             "'episode_data_index' nor 'meta.episodes'. Check your lerobot version."
         )
-    print(f"[VAL-DEBUG] Step 2: total_episodes={total_episodes}", flush=True)
+    total_episodes = len(loaded_episode_ids)
+    print(f"[VAL-DEBUG] Step 2: total_episodes={total_episodes}, loaded_episode_ids={loaded_episode_ids if len(loaded_episode_ids) <= 20 else f'{len(loaded_episode_ids)} episodes'}", flush=True)
 
-    # 3. Split episodes
-    train_eps, val_eps = _split_episodes(total_episodes, val_ratio, seed)
+    # 3. Split episodes (only the actually loaded ones)
+    train_eps, val_eps = _split_episodes(loaded_episode_ids, val_ratio, seed)
     logging.info(
         f"Train/Val split: {len(train_eps)} train episodes, {len(val_eps)} val episodes "
         f"(ratio={val_ratio}, seed={seed})"
@@ -543,8 +674,14 @@ def create_torch_data_loader_with_val(
     def _eps_to_indices(ep_ids):
         indices = []
         for ep in ep_ids:
-            start = episode_data_index["from"][ep].item()
-            end = episode_data_index["to"][ep].item()
+            if "ep_from" in episode_data_index:
+                # lerobot >= 0.4.4 path: dict-based lookup
+                start = episode_data_index["ep_from"][ep]
+                end = episode_data_index["ep_to"][ep]
+            else:
+                # lerobot <= 0.1.0 path: tensor-based lookup
+                start = episode_data_index["from"][ep].item()
+                end = episode_data_index["to"][ep].item()
             indices.extend(range(start, end))
         return indices
 

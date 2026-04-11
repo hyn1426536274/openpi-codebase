@@ -90,6 +90,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Task-based data filtering (per-task episode selection).
+    # If provided, only load episodes belonging to these tasks (matched by task name).
+    tasks: Sequence[str] | None = None
+    # Per-task episode indices. If provided, for each selected task only keep the episodes
+    # at these positions (0-indexed within that task's episode list).
+    # E.g. episodes_index=[0,1,2] means "take the first 3 episodes of each task".
+    episodes_index: Sequence[int] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -635,6 +643,7 @@ class TrainConfig:
 
     # Debug: limit number of episodes loaded. None = load all (default).
     # Set to a small number (e.g. 5) for quick pipeline verification.
+    # typically set to None if DataConfig.episodes_index is set
     debug_episodes: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
@@ -974,6 +983,45 @@ _CONFIGS = [
         # 仅以下 3 行是新增的 val 参数
         val_ratio=0.1,
         val_interval=50,
+        val_batches=2,
+    ),
+    # 验证 task 过滤功能：只加载 2 个 task，每个 task 取前 5 个 episode
+    TrainConfig(
+        name="pi05_ki_libero_task_filter_test",
+        project_name="pi05_research",
+        model=pi0_config.Pi0Config(
+            pi05_ki=True,
+            action_horizon=10,
+            fast_model_tokenizer_kwargs={"fast_tokenizer_path": "/workspace/data/pi_models/fast-action-tokenizer"},
+        ),
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                tasks=[
+                    "turn on the stove and put the moka pot on it",
+                    "put both moka pots on the stove",
+                ],
+                episodes_index=list(range(5)),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="/workspace/data/pi_models/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
+        num_train_steps=100,
+        num_workers=2,
+        log_interval=10,
+        val_ratio=0.2,
+        val_interval=20,
         val_batches=2,
     ),
     #

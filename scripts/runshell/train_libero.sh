@@ -26,7 +26,9 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 # 参数 2: 配置名称（默认 val_test 验证配置）
 # CONFIG_NAME="${2:-pi05_libero_val_test}" # 25
 # CONFIG_NAME="${2:-pi05_libero_torch_debug}" # libero24
-CONFIG_NAME="${2:-pi05_ki_libero_torch_debug}" # 23
+# CONFIG_NAME="${2:-pi05_ki_libero_torch_debug}" # 23
+CONFIG_NAME="${2:-pi05_ki_libero_task_filter_test}" # 26
+
 # 参数 3: 实验名称
 EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"
 # 参数 4: 是否 resume（默认 false）

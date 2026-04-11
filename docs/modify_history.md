@@ -6,7 +6,43 @@
 
 ---
 
-## ⭐ 最新进展（2026-04-10）
+## ⭐ 最新进展（2026-04-11）
+
+**按 Task 加载数据：支持 task 级别的数据过滤**
+
+核心改进：
+- ✅ `DataConfig` 新增 `tasks: Sequence[str] | None` 和 `episodes_index: Sequence[int] | None` 两个字段（对齐 openpi-comet-test B1K 的设计，数据筛选放在数据配置层）
+- ✅ `data_loader.py` 新增 `_resolve_task_episodes()` 函数：从 `meta.tasks` 获取 task_name → task_index 映射，从 `meta.episodes` 按 task 分组 episodes，在每个 task 内按 `episodes_index` 选取
+- ✅ `create_torch_dataset()` 自动消费 `DataConfig` 中的 task 过滤参数，与现有 `episodes` 参数取交集
+- ✅ `build_datasets()` 无需修改——task 参数通过 `data_config` 透传
+
+**`episodes_index` vs `debug_episodes` 注意事项**：
+- `episodes_index`（DataConfig）是 **per-task** 的位置索引——每个 task 内取第 0/1/2… 个 episode
+- `debug_episodes`（TrainConfig）是 **全局** 前 N 个 episode 索引（`list(range(N))`）
+- 两者同时使用时取交集，但语义不同可能导致空集（如 `debug_episodes=5` 只取 `[0-4]`，而 task_b 的 episodes 是 `[50-99]`）。建议使用 `episodes_index` 替代 `debug_episodes` 做数据量控制
+
+**使用示例**：
+```python
+data=LeRobotLiberoSubtaskDataConfig(
+    repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+    base_config=DataConfig(
+        prompt_from_task=True,
+        tasks=["turn on the stove and put the moka pot on it"],  # 只训练这个 task
+        episodes_index=list(range(20)),  # 每个 task 取前 20 个 episode
+    ),
+),
+```
+
+**文件变更清单**：
+
+| 文件 | 改动 |
+|------|------|
+| `src/openpi/training/config.py` | `DataConfig` 新增 `tasks` 和 `episodes_index` 字段 |
+| `src/openpi/training/data_loader.py` | 新增 `_resolve_task_episodes()`；`create_torch_dataset()` 集成 task 过滤逻辑；新增 `from collections import defaultdict` |
+
+---
+
+## ⭐ 进展（2026-04-10）
 
 **代码质量改进 + Device mismatch 修复 + 命名规范化**
 
