@@ -27,7 +27,12 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 # CONFIG_NAME="${2:-pi05_libero_val_test}" # 25
 # CONFIG_NAME="${2:-pi05_libero_torch_debug}" # libero24
 # CONFIG_NAME="${2:-pi05_ki_libero_torch_debug}" # 23
-CONFIG_NAME="${2:-pi05_ki_libero_task_filter_test}" # 26
+# CONFIG_NAME="${2:-pi05_ki_libero_task_filter_test}" # 26
+
+CONFIG_NAME="${2:-libero10_pi05ki_alltasks}" #
+# CONFIG_NAME="${2:-libero10_pi05_alltasks}" #
+# CONFIG_NAME="${2:-libero10_pi05ki_onetask}" #
+# CONFIG_NAME="${2:-libero10_pi05_onetask}" #
 
 # 参数 3: 实验名称
 EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"

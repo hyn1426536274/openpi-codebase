@@ -31,6 +31,10 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # PI05_KI: PI05 + subtask generation head + Knowledge Isolation attention
     pi05_ki: bool = False
+    # Ablation switches (only effective when pi05_ki=True)
+    enable_fast_loss: bool = True      # 是否计算 FAST AR loss
+    enable_subtask_loss: bool = True   # 是否计算 subtask AR loss
+    enable_ki_attention: bool = True   # 是否在 attention 中启用 KI detach
     # FAST tokenizer class (for PI0_FAST). For PI05_KI, use fast_model_tokenizer_kwargs instead.
     fast_model_tokenizer: type | None = None
     # Kwargs to pass to FASTTokenizer (e.g., {"fast_tokenizer_path": "/path/to/tokenizer"})
