@@ -33,6 +33,8 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        auto_subtask: bool = False,
+        subtask_refresh_interval: int = 10,
     ):
         """Initialize the Policy.
 
@@ -46,6 +48,8 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            auto_subtask: If True, automatically generate subtask before action inference (PI05_KI).
+            subtask_refresh_interval: Re-generate subtask every N infer() calls.
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -54,6 +58,12 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+
+        # Auto-subtask config and cache (PI05_KI)
+        self._auto_subtask = auto_subtask
+        self._subtask_refresh_interval = subtask_refresh_interval
+        self._cached_subtask: str | None = None
+        self._subtask_step_counter: int = 0
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -64,10 +74,22 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._generate_subtask = None
             self._rng = rng or jax.random.key(0)
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # --- Auto-subtask support (PI05_KI) ---
+        if self._auto_subtask and self._generate_subtask is not None:
+            if self._cached_subtask is None or self._subtask_step_counter >= self._subtask_refresh_interval:
+                subtask_result = self.generate_subtask(obs)
+                self._cached_subtask = subtask_result.get("subtask")
+                self._subtask_step_counter = 0
+                logging.info(f"[auto_subtask] Generated subtask: {self._cached_subtask}")
+            if self._cached_subtask:
+                obs = {**obs, "subtask": self._cached_subtask}
+            self._subtask_step_counter += 1
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -142,6 +164,15 @@ class Policy(BasePolicy):
                 subtask_text = after.strip()
 
         return {"subtask": subtask_text}
+
+    def reset_subtask_cache(self):
+        """Reset the cached subtask and step counter.
+
+        Call this at episode boundaries to ensure the model generates
+        a fresh subtask for the new episode.
+        """
+        self._cached_subtask = None
+        self._subtask_step_counter = 0
 
     @property
     def metadata(self) -> dict[str, Any]:

@@ -54,6 +54,11 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # Auto-subtask (PI05_KI): generate subtask before action inference
+    auto_subtask: bool = False
+    # Re-generate subtask every N infer() calls
+    subtask_refresh_interval: int = 10
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -90,7 +95,11 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                auto_subtask=args.auto_subtask,
+                subtask_refresh_interval=args.subtask_refresh_interval,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

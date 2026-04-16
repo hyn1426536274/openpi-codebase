@@ -1093,13 +1093,46 @@ _CONFIGS = [
         save_interval=2000,
     ),
     TrainConfig(
+        name="libero10_pi05_alltasks_f32",
+        project_name="pi05_research",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+        ),
+        pytorch_training_precision="float32",
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=8*2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="/workspace/data/pi_models/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
+        num_train_steps=30000,
+        num_workers=4,
+        log_interval=50,
+        val_ratio=0.1,
+        val_interval=50,
+        val_batches=2,
+        save_interval=2000,
+    ),
+    TrainConfig(
         name="libero10_pi05ki_onetask",
         project_name="pi05_research",
         model=pi0_config.Pi0Config(
             pi05_ki=True,
             action_horizon=10,
             fast_model_tokenizer_kwargs={"fast_tokenizer_path": "/workspace/data/pi_models/fast-action-tokenizer"},
-            discrete_state_input=False,
         ),
         data=LeRobotLiberoSubtaskDataConfig(
             repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
@@ -1134,8 +1167,6 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=10,
-            fast_model_tokenizer_kwargs={"fast_tokenizer_path": "/workspace/data/pi_models/fast-action-tokenizer"},
-            discrete_state_input=False,
         ),
         data=LeRobotLiberoSubtaskDataConfig(
             repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
