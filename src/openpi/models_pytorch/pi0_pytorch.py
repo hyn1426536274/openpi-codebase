@@ -612,13 +612,55 @@ class PI0Pytorch(nn.Module):
     def _build_subtask_prefix_tokens(self, observation) -> list[list[int]]:
         """Build the subtask generation prefix token sequences from the current observation.
 
-        Uses the same format as SubtaskTokenizer:
-            [BOS] "Task: {prompt}, State: {state_str};\\nSubtask: "
+        Prefer the already-tokenized KI subtask stream produced by
+        ``TokenizeKIInputs``. That stream is built before
+        ``PadStatesAndActions``, so it matches the training-time Task+State
+        prefix exactly. If those fields are unavailable, fall back to the older
+        reconstruction path.
 
         Returns a list (one per batch element) of token-id lists.
         """
         import numpy as np
 
+        if (
+            observation.subtask_tokenized_prompt is not None
+            and observation.subtask_tokenized_prompt_mask is not None
+        ):
+            tokenized = observation.subtask_tokenized_prompt  # [B, L]
+            prompt_masks = observation.subtask_tokenized_prompt_mask  # [B, L]
+            loss_masks = observation.subtask_token_loss_mask  # [B, L] or None
+
+            batch_size = tokenized.shape[0]
+            all_prefix_tokens = []
+
+            for b in range(batch_size):
+                mask = prompt_masks[b]
+                if isinstance(mask, torch.Tensor):
+                    valid_len = int(mask.sum().item())
+                    token_ids = tokenized[b, :valid_len].detach().cpu().tolist()
+                    if loss_masks is not None:
+                        loss_mask = loss_masks[b, :valid_len].detach().cpu()
+                        first_loss = torch.nonzero(loss_mask, as_tuple=False)
+                        if first_loss.numel() > 0:
+                            token_ids = token_ids[: int(first_loss[0].item())]
+                else:
+                    valid_len = int(np.sum(mask))
+                    token_ids = tokenized[b, :valid_len].tolist()
+                    if loss_masks is not None:
+                        loss_mask = np.asarray(loss_masks[b, :valid_len])
+                        first_loss = np.flatnonzero(loss_mask)
+                        if len(first_loss) > 0:
+                            token_ids = token_ids[: int(first_loss[0])]
+
+                if not token_ids:
+                    raise ValueError("subtask_tokenized_prompt contains no valid prefix tokens.")
+                all_prefix_tokens.append([int(token_id) for token_id in token_ids])
+
+            return all_prefix_tokens
+
+        # Fallback for older observations that do not carry the KI subtask
+        # token stream. This path may be less aligned because observation.state
+        # can already be padded at generation time.
         # Decode the main prompt from tokenized_prompt (recover text from token ids)
         tokenized = observation.tokenized_prompt  # [B, L]
         prompt_masks = observation.tokenized_prompt_mask  # [B, L]

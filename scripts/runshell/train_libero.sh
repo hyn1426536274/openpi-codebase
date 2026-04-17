@@ -33,7 +33,9 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 # CONFIG_NAME="${2:-libero10_pi05_alltasks}" #
 # CONFIG_NAME="${2:-libero10_pi05ki_onetask}" #
 # CONFIG_NAME="${2:-libero10_pi05_onetask}" #
-CONFIG_NAME="${2:-libero10_pi05_alltasks_f32}" #
+# CONFIG_NAME="${2:-libero10_pi05_alltasks_f32}" #
+CONFIG_NAME="${2:-libero10_pi05_alltasks_f32_v2}" #
+
 
 
 # 参数 3: 实验名称

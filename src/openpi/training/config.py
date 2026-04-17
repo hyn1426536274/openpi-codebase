@@ -1093,7 +1093,7 @@ _CONFIGS = [
         save_interval=2000,
     ),
     TrainConfig(
-        name="libero10_pi05_alltasks_f32",
+        name="libero10_pi05_alltasks_f32_v2",
         project_name="pi05_research",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -1107,7 +1107,7 @@ _CONFIGS = [
             ),
             extra_delta_transform=False,
         ),
-        batch_size=8*2,
+        batch_size=8*4,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=100,
             peak_lr=5e-5,
@@ -1118,13 +1118,13 @@ _CONFIGS = [
         ema_decay=None,
         pytorch_weight_path="/workspace/data/pi_models/pi05_base",
         checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
-        num_train_steps=30000,
+        num_train_steps=30000*8,
         num_workers=4,
         log_interval=50,
         val_ratio=0.1,
         val_interval=50,
         val_batches=2,
-        save_interval=2000,
+        save_interval=5000,
     ),
     TrainConfig(
         name="libero10_pi05ki_onetask",

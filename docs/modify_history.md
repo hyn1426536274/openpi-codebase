@@ -6,7 +6,94 @@
 
 ---
 
-## ⭐ 最新进展（2026-04-11）
+## ⭐ 最新进展（2026-04-17）
+
+**PI05_KI Subtask 推理前缀与训练对齐**
+
+核心改进：
+- ✅ `pi0_pytorch.py` 的 `_build_subtask_prefix_tokens()` 不再优先从 `observation.tokenized_prompt + observation.state` 手工重建 `Task: ... State: ...\nSubtask: ` 前缀
+- ✅ 推理时优先直接复用 `TokenizeKIInputs` 生成的 `subtask_tokenized_prompt` / `subtask_tokenized_prompt_mask`
+- ✅ 利用 `subtask_token_loss_mask` 自动定位 prefix/postfix 分界，只保留训练时真正的 prefix（`Task + State + "\n"`），让模型自己生成完整的 `Subtask: xxx.` postfix
+- ✅ 保留旧的手工重建逻辑作为 fallback，兼容不带 KI subtask token 流的旧 observation
+
+**解决的问题**：
+- 旧实现是在完整 transform 之后，从 `observation.state` 重新离散化构造 subtask prefix；而 `PadStatesAndActions` 在 `TokenizeKIInputs` 之后执行，推理阶段这里的 `state` 可能已经 pad，和训练时 `SubtaskTokenizer` 看到的 state 不一致
+- 旧实现的 prefix 直接包含 `Subtask: `，而训练时 subtask 分支的 target postfix 本身就是从 `Subtask: {subtask}.` 开始，存在 train/infer mismatch
+- 新实现直接复用训练同源的 token 前缀，避免了 padded state 和 prefix 起始位置两类不对齐
+
+**行为变化**：
+- 推理时 `generate_subtask()` 现在会优先使用 `TokenizeKIInputs` 产出的 subtask token 流
+- 如果当前 observation 中存在 `subtask_tokenized_prompt`，则 subtask 生成的 prefix 与训练时 subtask loss 使用的 prefix 保持一致
+- 对外接口无变化；`Policy.generate_subtask()`、`auto_subtask` 和服务端 CLI 用法不需要修改
+
+**文件变更清单**：
+
+| 文件 | 改动 |
+|------|------|
+| `src/openpi/models_pytorch/pi0_pytorch.py` | `_build_subtask_prefix_tokens()` 改为优先复用 `subtask_tokenized_prompt`，并用 `subtask_token_loss_mask` 截取训练同源 prefix；旧的 state 重建逻辑保留为 fallback |
+
+---
+
+## ⭐ 最新进展（2026-04-17）
+
+**推理闭环：PI05_KI Auto-Subtask → Action 自动联动**
+
+核心改进：
+- ✅ `Policy.infer()` 新增 `auto_subtask` 支持：在 transform 之前自动调用模型自身的 `generate_subtask()` 生成 subtask，注入 obs 后经 `TokenizeKIInputs` 正确条件化 action expert（与训练一致）
+- ✅ Subtask 缓存机制：每 `subtask_refresh_interval` 步重新生成 subtask，避免每步都做 AR 解码
+- ✅ 控制完全在服务端：通过 `serve_policy.py` 的 `--auto_subtask` / `--subtask_refresh_interval` CLI 参数控制，评估脚本（client 端）无需任何改动
+- ✅ 向后兼容：不启用 `--auto_subtask` 时行为完全不变
+
+**解决的问题**：
+- 训练时 action expert 以 subtask 为条件（通过 `TokenizeKIInputs` 的 `FASTTokenizer` 和 `PaligemmaTokenizer`），但推理时直接用 full task prompt → 训练/推理不对称
+- 模型自带的 `generate_subtask()` 方法（`pi0_pytorch.py:664-781`）已实现但从未被推理流程调用
+
+**架构设计**：
+```
+serve_policy.py (--auto_subtask --subtask_refresh_interval 10)
+  ↓
+policy_config.py (create_trained_policy 透传参数)
+  ↓
+Policy.__init__(auto_subtask=True, subtask_refresh_interval=10)
+  ↓
+Policy.infer():
+  1. 检查 auto_subtask 标志 + 模型是否支持 generate_subtask
+  2. 缓存过期时调用 self.generate_subtask(obs) → AR 解码 subtask 文本
+  3. 注入 obs["subtask"] = cached_subtask
+  4. 后续 transform pipeline（TokenizeKIInputs）正确使用 subtask 条件化
+  ↓
+WebSocket 服务器 / 评估脚本（无需改动）
+```
+
+**使用方式**：
+```bash
+# 启动带 auto_subtask 的推理服务
+uv run scripts/serve_policy.py policy:checkpoint \
+  --policy.config=libero10_pi05ki_alltasks \
+  --policy.dir=/path/to/checkpoint \
+  --auto_subtask --subtask_refresh_interval 10
+
+# 评估脚本不需要任何改动
+python examples/libero/main.py --task_suite_name libero_10
+```
+
+**已知限制**：
+- `reset_subtask_cache()` 不会在 episode 边界自动调用（WebSocket 协议无 episode 边界信号），缓存通过 `subtask_refresh_interval` 自然刷新
+- 仅支持 PyTorch PI05_KI 模型（JAX 路径不支持 `generate_subtask`）
+
+**文件变更清单**：
+
+| 文件 | 改动 |
+|------|------|
+| `src/openpi/policies/policy.py` | `__init__` 新增 `auto_subtask`/`subtask_refresh_interval` 参数 + 缓存状态；`infer()` 开头添加 auto_subtask 逻辑；新增 `reset_subtask_cache()` 方法 |
+| `src/openpi/policies/policy_config.py` | `create_trained_policy()` 签名新增 `auto_subtask`/`subtask_refresh_interval`，透传到 `Policy()` 构造函数 |
+| `scripts/serve_policy.py` | `Args` 新增 `auto_subtask: bool = False` 和 `subtask_refresh_interval: int = 10`；`create_policy()` 透传到 `create_trained_policy()` |
+
+详见 [9.1 Policy 推理层](#91-新增-pi05_ki-推理支持)
+
+---
+
+## ⭐ 进展（2026-04-11）
 
 **按 Task 加载数据：支持 task 级别的数据过滤**
 
@@ -1017,31 +1104,58 @@ v3 数据集 `libero_10_subtasks_fixed` 的 feature key 与 `lerobot` 数据集�
 
 #### 9.1 新增 PI05_KI 推理支持
 
-在 `Policy.infer()` 中，PI05_KI 模式需要额外步骤：
+**已实现方案（2026-04-17）**：Auto-subtask 在 `Policy.infer()` 中完成，控制通过构造函数参数传入（由 `serve_policy.py` CLI 参数驱动），评估脚本无需改动。
 
 ```python
 class Policy(BasePolicy):
-    def infer(self, obs: dict, noise=None) -> dict:
-        # 现有逻辑（不变）：
-        # 1. input transforms
-        # 2. create Observation
-        # 3. model.sample_actions()
-        # 4. output transforms
+    def __init__(self, model, *, ..., auto_subtask=False, subtask_refresh_interval=10):
+        # ... 现有初始化 ...
+        self._auto_subtask = auto_subtask
+        self._subtask_refresh_interval = subtask_refresh_interval
+        self._cached_subtask: str | None = None
+        self._subtask_step_counter: int = 0
+        # PyTorch 模型：绑定 generate_subtask 方法
+        if self._is_pytorch_model:
+            self._generate_subtask = getattr(model, "generate_subtask", None)
 
-        # PI05_KI 额外逻辑：
-        if self._is_pi05_ki:
-            # 在 sample_actions 前先生成子任务文本
-            subtask_text = self._model.generate_subtask(observation)
-            # 将 subtask_text 注入回 observation 的 tokenized_prompt
-            # （作为当前 step 的 prompt 更新）
-            observation = self._inject_subtask(observation, subtask_text)
+    def infer(self, obs: dict, *, noise=None) -> dict:
+        # --- Auto-subtask（transform 之前执行）---
+        if self._auto_subtask and self._generate_subtask is not None:
+            if self._cached_subtask is None or self._subtask_step_counter >= self._subtask_refresh_interval:
+                subtask_result = self.generate_subtask(obs)
+                self._cached_subtask = subtask_result.get("subtask")
+                self._subtask_step_counter = 0
+                logging.info(f"[auto_subtask] Generated subtask: {self._cached_subtask}")
+            if self._cached_subtask:
+                obs = {**obs, "subtask": self._cached_subtask}
+            self._subtask_step_counter += 1
+        # ... 后续 transform + 推理逻辑不变 ...
 
-        ...
-
-    def _inject_subtask(self, observation: Observation, subtask: list[str]) -> Observation:
-        """将生成的子任务文本 re-tokenize 后注入 Observation.tokenized_prompt"""
-        ...
+    def reset_subtask_cache(self):
+        """Episode 边界调用，重置缓存。"""
+        self._cached_subtask = None
+        self._subtask_step_counter = 0
 ```
+
+**关键设计**：subtask 注入发生在 transform 之前，这样 `TokenizeKIInputs` 中的 `FASTTokenizer` 和 `PaligemmaTokenizer` 都能用 subtask 条件化（与训练一致）。
+
+### 文件：`src/openpi/policies/policy_config.py`
+
+#### 9.1.1 透传 auto_subtask 参数
+
+`create_trained_policy()` 新增 `auto_subtask` 和 `subtask_refresh_interval` 参数，直接传给 `Policy()` 构造函数。
+
+### 文件：`scripts/serve_policy.py`
+
+#### 9.1.2 CLI 参数控制
+
+`Args` 新增：
+```python
+auto_subtask: bool = False          # 启用自动 subtask 生成
+subtask_refresh_interval: int = 10  # 每 N 步刷新 subtask
+```
+
+`create_policy()` 将这两个参数透传到 `create_trained_policy()`。
 
 ### 文件：`src/openpi/policies/libero_policy.py`
 
@@ -1164,7 +1278,9 @@ python test-scripts/merge_lora.py \
 | `src/openpi/training/config.py` | ModelTransformFactory 新增 PI05_KI 分支；新增 LeRobotLiberoSubtaskDataConfig (subtask 数据集 key 映射)；pi05_ki_libero_torch_debug 改用 Subtask config；_load_norm_stats fallback | 全部 | P0-P1 | ✅ 已完成 |
 | `src/openpi/training/data_loader.py` | 导入路径迁移；PromptFromLeRobotTask 兼容 DataFrame；episode_data_index 从 meta.episodes 重建；_EnsureSubtask | Subtask, 兼容性 | P1 | ✅ 已完成 |
 | `pyproject.toml` | lerobot 从 git rev 改为 `==0.4.4`（PyPI） | 兼容性 | P0 | ✅ 已完成 |
-| `src/openpi/policies/policy.py` | PI05_KI 推理, generate_subtask | Subtask | P1 | ✅ 已完成 |
+| `src/openpi/policies/policy.py` | PI05_KI 推理, generate_subtask, auto_subtask 缓存机制, reset_subtask_cache | Subtask, 推理闭环 | P1 | ✅ 已完成 |
+| `src/openpi/policies/policy_config.py` | `create_trained_policy()` 透传 auto_subtask/subtask_refresh_interval | 推理闭环 | P1 | ✅ 已完成 |
+| `scripts/serve_policy.py` | Args 新增 auto_subtask/subtask_refresh_interval CLI 参数 | 推理闭环 | P1 | ✅ 已完成 |
 | `src/openpi/policies/libero_policy.py` | LiberoInputs 支持 PI05_KI | LIBERO | P1 | ✅ 已完成 |
 | `scripts/train_pytorch.py` | 多路损失合并, 分别记录 wandb；新增验证支持 | 全部 | P1 | ✅ 已完成 |
 | `test-scripts/merge_lora.py` | 新建（从 comet-test 移植） | LoRA | P2 | ⬜ 未完成 |
@@ -1214,6 +1330,14 @@ python test-scripts/merge_lora.py \
 16. ✅ `train_pytorch.py`：`validate()` 函数 + 训练循环中定期验证 + wandb 记录 `val_loss/*`
 
 **验证**：设置 `val_ratio=0.1`，确认 wandb 出现 `val_loss/action` 等指标；设置 `val_ratio=0` 确认行为与原来一致。
+
+### Phase 4.6：推理闭环 — Auto-Subtask（P1）
+
+17. ✅ `policy.py`：`infer()` 添加 auto_subtask 逻辑 + subtask 缓存 + `reset_subtask_cache()`
+18. ✅ `policy_config.py`：`create_trained_policy()` 透传 `auto_subtask` / `subtask_refresh_interval`
+19. ✅ `serve_policy.py`：CLI 参数 `--auto_subtask` / `--subtask_refresh_interval`
+
+**验证**：启动 `--auto_subtask` 服务，观察日志中 `[auto_subtask] Generated subtask: ...` 输出，确认 subtask 被正确注入 transform pipeline。
 
 ### Phase 5：LoRA 与工具（P2，可后续进行）
 
