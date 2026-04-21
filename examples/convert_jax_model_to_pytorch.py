@@ -559,7 +559,7 @@ def main(
     checkpoint_dir: str,
     config_name: str,
     output_path: str | None = None,
-    precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
+    precision: Literal["float32", "bfloat16", "float16"] = "float32", # default bfloat16, use 32 now
     *,
     inspect_only: bool = False,
 ):

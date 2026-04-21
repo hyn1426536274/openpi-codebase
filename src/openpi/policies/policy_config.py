@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -53,8 +54,19 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
+        # inference precision now depends on the training config's pytorch_training_precision
+        pytorch_precision = train_config.pytorch_training_precision
+        if hasattr(train_config.model, "dtype"):
+            # train_config.model.load_pytorch will load the model by train_config.model.dtype
+            # align train_config.model.dtype with pytorch_precision 
+            # to make sure the model is loaded with the correct precision
+            train_config = dataclasses.replace(
+                train_config,
+                model=dataclasses.replace(train_config.model, dtype=pytorch_precision),
+            )
+        logging.info("Using PyTorch inference precision: %s", pytorch_precision)
         model = train_config.model.load_pytorch(train_config, weight_path)
-        model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        model.paligemma_with_expert.to_bfloat16_for_selected_params(pytorch_precision)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

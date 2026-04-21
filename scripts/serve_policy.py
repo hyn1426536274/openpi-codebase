@@ -75,8 +75,8 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         dir="gs://openpi-assets/checkpoints/pi05_droid",
     ),
     EnvMode.LIBERO: Checkpoint(
-        config="pi05_libero",
-        dir="gs://openpi-assets/checkpoints/pi05_libero",
+        config="libero10_pi05ki_alltasks", # pi05_libero
+        dir="/home/hyn/data/models/libero10_exps/libero10_pi05ki_alltasks/pi05_libero_20260415_145622/30000",
     ),
 }
 

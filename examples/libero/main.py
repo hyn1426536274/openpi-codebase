@@ -1,8 +1,11 @@
 import collections
 import dataclasses
+import datetime
+import json
 import logging
 import math
 import pathlib
+import textwrap
 
 import imageio
 from libero.libero import benchmark
@@ -11,6 +14,8 @@ from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
+from PIL import Image
+from PIL import ImageDraw
 import tqdm
 import tyro
 
@@ -32,15 +37,17 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
-    num_trials_per_task: int = 50  # Number of rollouts per task
+    num_trials_per_task: int = 50  # Number of rollouts per task (default: 50)
 
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
+    eval_name: str = "default_eval"  # Subdirectory under data/libero used to save outputs
+    video_out_path: str = "data/libero"  # Base path for evaluation outputs
+    result_out_path: str = "data/libero"  # Base path for evaluation outputs
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -55,7 +62,11 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    video_out_path = pathlib.Path(args.video_out_path) / args.eval_name / "videos"
+    result_out_path = pathlib.Path(args.result_out_path) / args.eval_name / "results"
+
+    video_out_path.mkdir(parents=True, exist_ok=True)
+    result_out_path.mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -74,6 +85,7 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    task_results = []  # Collect per-task results
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task
         task = task_suite.get_task(task_id)
@@ -99,6 +111,7 @@ def eval_libero(args: Args) -> None:
             # Setup
             t = 0
             replay_images = []
+            current_subtask = None
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
@@ -114,15 +127,15 @@ def eval_libero(args: Args) -> None:
                     # IMPORTANT: rotate 180 degrees to match train preprocessing
                     img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                     wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    # TEMP DEBUG: horizontally flip model inputs for evaluation-only testing.
+                    img = np.ascontiguousarray(img[:, ::-1])
+                    wrist_img = np.ascontiguousarray(wrist_img[:, ::-1])
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
                     )
                     wrist_img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
                     )
-
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
 
                     if not action_plan:
                         # Finished executing previous action chunk -- compute new chunk
@@ -141,11 +154,17 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        policy_result = client.infer(element)
+                        action_chunk = policy_result["actions"]
+                        current_subtask = policy_result.get("current_subtask", current_subtask)
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         action_plan.extend(action_chunk[: args.replan_steps])
+
+                    # Save preprocessed image for replay video.
+                    # Debug/visualization-only overlay: show the current auto-subtask when the server provides it.
+                    replay_images.append(_draw_subtask_overlay(img, current_subtask))
 
                     action = action_plan.popleft()
 
@@ -168,7 +187,7 @@ def eval_libero(args: Args) -> None:
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                video_out_path / f"rollout_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
                 fps=10,
             )
@@ -179,10 +198,36 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
         # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+        task_success_rate = float(task_successes) / float(task_episodes)
+        logging.info(f"Current task success rate: {task_success_rate}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+        task_results.append({
+            "task_id": task_id,
+            "task_description": task_description,
+            "num_episodes": task_episodes,
+            "num_successes": task_successes,
+            "success_rate": task_success_rate,
+        })
+
+    # Save structured results to JSON
+    total_success_rate = float(total_successes) / float(total_episodes)
+    results = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "task_suite_name": args.task_suite_name,
+        "num_trials_per_task": args.num_trials_per_task,
+        "seed": args.seed,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "total_success_rate": total_success_rate,
+        "per_task_results": task_results,
+    }
+    result_file = result_out_path / f"results_{args.task_suite_name}.json"
+    with open(result_file, "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    logging.info(f"Results saved to {result_file}")
+
+    logging.info(f"Total success rate: {total_success_rate}")
     logging.info(f"Total episodes: {total_episodes}")
 
 
@@ -194,6 +239,29 @@ def _get_libero_env(task, resolution, seed):
     env = OffScreenRenderEnv(**env_args)
     env.seed(seed)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
+
+
+def _draw_subtask_overlay(image: np.ndarray, subtask) -> np.ndarray:
+    """Draws the current auto-subtask on replay frames for debugging videos."""
+    if not subtask:
+        return image
+
+    pil_image = Image.fromarray(image)
+    overlay = Image.new("RGBA", pil_image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    text = "Subtask: " + str(subtask)
+    lines = textwrap.wrap(text, width=44)[:3]
+    line_height = 13
+    padding = 5
+    box_width = min(pil_image.width - 8, 220)
+    box_height = padding * 2 + line_height * len(lines)
+
+    draw.rectangle((4, 4, 4 + box_width, 4 + box_height), fill=(0, 0, 0, 170))
+    for idx, line in enumerate(lines):
+        draw.text((4 + padding, 4 + padding + idx * line_height), line, fill=(255, 255, 255, 255))
+
+    return np.asarray(Image.alpha_composite(pil_image.convert("RGBA"), overlay).convert("RGB"))
 
 
 def _quat2axisangle(quat):

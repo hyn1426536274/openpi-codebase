@@ -127,6 +127,10 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if self._auto_subtask:
+            # Debug/visualization metadata only: websocket clients can overlay this
+            # on videos without affecting action inference.
+            outputs["current_subtask"] = self._cached_subtask
         return outputs
 
     def generate_subtask(self, obs: dict) -> dict:
