@@ -6,6 +6,39 @@
 
 ---
 
+## ⭐ 最新进展（2026-04-22）
+
+**PI05_KI Official 权重消融实验、Loss 加权与梯度分组调试**
+
+核心改进：
+- ✅ `Pi0Config` 新增 `action_loss_alpha` / `ar_loss_alpha`，用于显式控制 PI05_KI 多 loss 训练中的 flow/action loss 与 AR loss 权重
+- ✅ PyTorch 训练与验证路径统一使用加权总 loss：`action_loss_alpha * action + ar_loss_alpha * subtask + ar_loss_alpha * fast`
+- ✅ 新增 grouped grad norm 调试能力，按 `vlm_backbone` / `lm_head` / `action_expert` / `other` 分组统计梯度范数和有梯度参数数量
+- ✅ 修正 PaliGemma tied LM head 的统计口径：`paligemma.model.language_model.embed_tokens.weight` 归入 `lm_head`，避免 `grad_params/lm_head=0` 的误判
+- ✅ 新增 `/workspace/gradcheck.txt` 调试 dump：每次 backward 后记录参数名、是否有梯度、shape 与单参数 grad norm，方便定位梯度流向
+- ✅ WandB resume 初始化改为使用 `WANDB_ENTITY` 环境变量，默认回退到当前项目 entity，避免恢复历史 run 时 entity 不一致导致失败
+- ✅ 新增 official 权重训练与消融配置：基于 `/workspace/data/pi_official_models/torch/pi05_base` 的 PI05 / PI05_KI official 训练，以及 no-fast、no-subtask、no-KI 三个 component ablation
+- ✅ official component ablation 默认开启 grouped grad logging，`grouped_grad_log_interval=100`，用于低开销监控 KI 梯度隔离效果
+- ✅ `train_libero.sh` 增加 official / ablation / resume 模板与 `EXTRA_TRAIN_ARGS` 透传，便于中断后按原 `config + exp_name + --resume` 继续训练
+
+**实验配置说明**：
+- `libero10_pi05ki_alltasks_official`：PI05_KI，使用从 OpenPI official/JAX 权重转换来的 torch `pi05_base`
+- `libero10_pi05_alltasks_official`：非 KI PI05 official baseline
+- `libero10_pi05ki_alltasks_official_no_fast`：关闭 FAST AR loss，仅保留 subtask AR loss 与 flow/action loss
+- `libero10_pi05ki_alltasks_official_no_subtask`：关闭 subtask AR loss，仅保留 FAST AR loss 与 flow/action loss
+- `libero10_pi05ki_alltasks_official_no_ki`：关闭 KI attention detach，用于对比无知识隔离时的梯度耦合
+
+**文件变更清单**：
+
+| 文件 | 改动 |
+|------|------|
+| `src/openpi/models/pi0_config.py` | 新增 `action_loss_alpha` / `ar_loss_alpha`，支持 PI05_KI loss 权重消融 |
+| `scripts/train_pytorch.py` | 多 loss 加权训练/验证；WandB resume entity 修复；新增 gradcheck dump 与 grouped grad norm 统计；修正 tied LM head 分组 |
+| `src/openpi/training/config.py` | `TrainConfig` 新增 grouped grad logging 参数；新增 official PI05/PI05_KI 训练配置与 no-fast/no-subtask/no-KI 消融配置 |
+| `scripts/runshell/train_libero.sh` | 增加 official 消融与 resume 模板；支持 `EXTRA_TRAIN_ARGS` 透传 |
+
+---
+
 ## ⭐ 最新进展（2026-04-17）
 
 **PI05_KI Subtask 推理前缀与训练对齐**

@@ -35,6 +35,8 @@ class Pi0Config(_model.BaseModelConfig):
     enable_fast_loss: bool = True      # 是否计算 FAST AR loss
     enable_subtask_loss: bool = True   # 是否计算 subtask AR loss
     enable_ki_attention: bool = True   # 是否在 attention 中启用 KI detach
+    action_loss_alpha: float = 1.0     # Weight for the flow/action loss in PI05_KI training.
+    ar_loss_alpha: float = 0.1         # Weight for each AR loss when combining PI05_KI losses.
     # FAST tokenizer class (for PI0_FAST). For PI05_KI, use fast_model_tokenizer_kwargs instead.
     fast_model_tokenizer: type | None = None
     # Kwargs to pass to FASTTokenizer (e.g., {"fast_tokenizer_path": "/path/to/tokenizer"})

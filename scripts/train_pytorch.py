@@ -104,12 +104,19 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 
+    wandb_entity = os.environ.get("WANDB_ENTITY", "huangyinuo321-uestc")
+
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(
+            entity=wandb_entity,
+            id=run_id,
+            resume="must",
+            project=config.project_name,
+        )
     else:
         wandb.init(
-            entity="huangyinuo321-uestc",
+            entity=wandb_entity,
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
@@ -187,7 +194,7 @@ def build_datasets(config: _config.TrainConfig):
 
 
 @torch.no_grad()
-def validate(model, val_loader, device, num_batches):
+def validate(model, val_loader, device, num_batches, action_loss_alpha=1.0, ar_loss_alpha=0.1):
     """Compute validation loss without gradient updates.
 
     Runs the model in eval mode on up to `num_batches` from val_loader,
@@ -206,7 +213,12 @@ def validate(model, val_loader, device, num_batches):
         if isinstance(losses, dict):
             for k, v in losses.items():
                 val_losses[f"val_loss/{k}"].append(v.item())
-            val_losses["val_loss/total"].append(sum(v.item() for v in losses.values()))
+            total_loss = (
+                action_loss_alpha * losses["action"]
+                + ar_loss_alpha * losses.get("subtask", torch.tensor(0.0, device=device))
+                + ar_loss_alpha * losses.get("fast", torch.tensor(0.0, device=device))
+            )
+            val_losses["val_loss/total"].append(total_loss.item())
         else:
             val_losses["val_loss/action"].append(losses.mean().item())
     model.train()
@@ -231,6 +243,82 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def get_raw_model(model):
+    """Get the underlying model, handling DDP wrapper."""
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def _grad_global_norm(params):
+    grads = [p.grad.detach() for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    total = torch.zeros((), device=grads[0].device, dtype=torch.float32)
+    for grad in grads:
+        total = total + torch.sum(grad.float() * grad.float())
+    return float(torch.sqrt(total).item())
+
+
+def dump_gradcheck(model, path="/workspace/gradcheck.txt"):
+    """Dump parameter names and whether they have gradients after backward."""
+    raw_model = get_raw_model(model)
+    with open(path, "w", encoding="utf-8") as gradcheck_file:
+        for name, param in raw_model.named_parameters():
+            has_grad = param.grad is not None
+            grad_norm = _grad_global_norm([param]) if has_grad else 0.0
+            gradcheck_file.write(
+                f"{name}\thas_grad={has_grad}\tshape={tuple(param.shape)}\tgrad_norm={grad_norm:.8e}\n"
+            )
+
+
+def compute_grouped_grad_stats(model):
+    """Compute grouped gradient norms for KI debugging.
+
+    Returns a tuple of:
+      - stats dict with grad/<group> and grad_params/<group>
+      - list of parameter names that fell into the "other" bucket
+    """
+    raw_model = get_raw_model(model)
+    groups = {
+        "vlm_backbone": [],
+        "lm_head": [],
+        "action_expert": [],
+        "other": [],
+    }
+    other_names = []
+
+    for name, param in raw_model.named_parameters():
+        if param.grad is None:
+            continue
+
+        if (
+            name.startswith("paligemma_with_expert.paligemma.lm_head.")
+            # PaliGemma ties lm_head to input token embeddings, so named_parameters()
+            # often exposes the shared weight under embed_tokens instead of lm_head.
+            or name == "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
+        ):
+            groups["lm_head"].append(param)
+        elif name.startswith("paligemma_with_expert.paligemma."):
+            groups["vlm_backbone"].append(param)
+        elif (
+            name.startswith("paligemma_with_expert.gemma_expert.")
+            or name.startswith("action_in_proj.")
+            or name.startswith("action_out_proj.")
+            or name.startswith("time_mlp_")
+            or name.startswith("state_proj.") # seems no such param
+            or name.startswith("action_time_mlp_") # seems no such param
+        ):
+            groups["action_expert"].append(param)
+        else:
+            groups["other"].append(param)
+            other_names.append(name)
+
+    stats = {}
+    for group_name, params in groups.items():
+        stats[f"grad/{group_name}"] = _grad_global_norm(params)
+        stats[f"grad_params/{group_name}"] = len(params)
+    return stats, other_names
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
@@ -579,6 +667,7 @@ def train_loop(config: _config.TrainConfig):
     model.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
+    warned_other_grad_params = False
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
@@ -635,10 +724,18 @@ def train_loop(config: _config.TrainConfig):
             #   - dict: PI05_KI multi-loss {"action": t, "subtask": t, "fast": t}
             per_loss_dict = {}
             if isinstance(losses, dict):
-                # Sum all sub-losses to get the total scalar loss for backward.
-                # Each value is already a scalar (mean reduced inside forward()).
-                loss = sum(losses.values())
+                # PI05_KI: keep flow loss as the main objective and scale AR auxiliaries
+                # so ablations can control their contribution without changing the model.
+                action_loss_alpha = getattr(config.model, "action_loss_alpha", 1.0)
+                ar_loss_alpha = getattr(config.model, "ar_loss_alpha", 0.1)
+                loss = (
+                    action_loss_alpha * losses["action"]
+                    + ar_loss_alpha * losses.get("subtask", torch.tensor(0.0, device=device))
+                    + ar_loss_alpha * losses.get("fast", torch.tensor(0.0, device=device))
+                )
                 per_loss_dict = {f"loss/{k}": v.item() for k, v in losses.items()}
+                per_loss_dict["loss/action_loss_alpha"] = action_loss_alpha
+                per_loss_dict["loss/ar_loss_alpha"] = ar_loss_alpha
             elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
                 loss = losses.mean()
@@ -649,6 +746,29 @@ def train_loop(config: _config.TrainConfig):
 
             # Backward pass
             loss.backward()
+            if is_main:
+                dump_gradcheck(model)
+
+            grouped_grad_stats = {}
+            grouped_grad_interval = (
+                config.log_interval
+                if config.grouped_grad_log_interval is None
+                else config.grouped_grad_log_interval
+            )
+            should_log_grouped_grads = (
+                is_main
+                and config.log_grouped_grad_norms
+                and grouped_grad_interval > 0
+                and (global_step % grouped_grad_interval == 0)
+            )
+            if should_log_grouped_grads:
+                grouped_grad_stats, other_grad_param_names = compute_grouped_grad_stats(model)
+                if other_grad_param_names and not warned_other_grad_params:
+                    logging.warning(
+                        "Grouped grad logging found uncategorized parameters in 'other': %s",
+                        ", ".join(other_grad_param_names),
+                    )
+                    warned_other_grad_params = True
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
@@ -675,6 +795,7 @@ def train_loop(config: _config.TrainConfig):
                     "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 }
                 info.update(per_loss_dict)  # add loss/action, loss/subtask, loss/fast if PI05_KI
+                info.update(grouped_grad_stats)
                 infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
@@ -696,6 +817,10 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
+                if config.log_grouped_grad_norms:
+                    grouped_grad_keys = [k for k in infos[0] if k.startswith("grad/") or k.startswith("grad_params/")]
+                    if grouped_grad_keys:
+                        logging.info(" ".join(f"{k}={sum(info[k] for info in infos) / len(infos):.4f}" for k in grouped_grad_keys))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -711,6 +836,9 @@ def train_loop(config: _config.TrainConfig):
                     sub_loss_keys = [k for k in infos[0] if k.startswith("loss/")]
                     for k in sub_loss_keys:
                         log_payload[k] = sum(info[k] for info in infos) / len(infos)
+                    grouped_grad_keys = [k for k in infos[0] if k.startswith("grad/") or k.startswith("grad_params/")]
+                    for k in grouped_grad_keys:
+                        log_payload[k] = sum(info[k] for info in infos) / len(infos)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
@@ -725,7 +853,14 @@ def train_loop(config: _config.TrainConfig):
             ):
                 print(f"[TRAIN-DEBUG] Starting validation at step {global_step}...", flush=True)
                 raw_model = model.module if use_ddp else model
-                val_metrics = validate(raw_model, val_loader, device, config.val_batches)
+                val_metrics = validate(
+                    raw_model,
+                    val_loader,
+                    device,
+                    config.val_batches,
+                    action_loss_alpha=getattr(config.model, "action_loss_alpha", 1.0),
+                    ar_loss_alpha=getattr(config.model, "ar_loss_alpha", 0.1),
+                )
                 print(f"[TRAIN-DEBUG] Validation done: {val_metrics}", flush=True)
                 if val_metrics:
                     logging.info(
