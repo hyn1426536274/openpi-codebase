@@ -746,22 +746,11 @@ def train_loop(config: _config.TrainConfig):
 
             # Backward pass
             loss.backward()
-            if is_main:
-                dump_gradcheck(model)
+            # if is_main:
+            #     dump_gradcheck(model)
 
             grouped_grad_stats = {}
-            grouped_grad_interval = (
-                config.log_interval
-                if config.grouped_grad_log_interval is None
-                else config.grouped_grad_log_interval
-            )
-            should_log_grouped_grads = (
-                is_main
-                and config.log_grouped_grad_norms
-                and grouped_grad_interval > 0
-                and (global_step % grouped_grad_interval == 0)
-            )
-            if should_log_grouped_grads:
+            if is_main and config.log_grouped_grad_norms:
                 grouped_grad_stats, other_grad_param_names = compute_grouped_grad_stats(model)
                 if other_grad_param_names and not warned_other_grad_params:
                     logging.warning(
@@ -795,7 +784,7 @@ def train_loop(config: _config.TrainConfig):
                     "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                 }
                 info.update(per_loss_dict)  # add loss/action, loss/subtask, loss/fast if PI05_KI
-                info.update(grouped_grad_stats)
+                info.update(grouped_grad_stats) # add grouped grad norms if enabled
                 infos.append(info)
 
             if is_main and (global_step % config.log_interval == 0):
@@ -817,10 +806,12 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
+                grouped_grad_means = {}
                 if config.log_grouped_grad_norms:
                     grouped_grad_keys = [k for k in infos[0] if k.startswith("grad/") or k.startswith("grad_params/")]
                     if grouped_grad_keys:
-                        logging.info(" ".join(f"{k}={sum(info[k] for info in infos) / len(infos):.4f}" for k in grouped_grad_keys))
+                        grouped_grad_means = {k: sum(info[k] for info in infos) / len(infos) for k in grouped_grad_keys}
+                        logging.info(" ".join(f"{k}={v:.4f}" for k, v in grouped_grad_means.items()))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -836,9 +827,8 @@ def train_loop(config: _config.TrainConfig):
                     sub_loss_keys = [k for k in infos[0] if k.startswith("loss/")]
                     for k in sub_loss_keys:
                         log_payload[k] = sum(info[k] for info in infos) / len(infos)
-                    grouped_grad_keys = [k for k in infos[0] if k.startswith("grad/") or k.startswith("grad_params/")]
-                    for k in grouped_grad_keys:
-                        log_payload[k] = sum(info[k] for info in infos) / len(infos)
+                    for k, v in grouped_grad_means.items():
+                        log_payload[k] = v
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
