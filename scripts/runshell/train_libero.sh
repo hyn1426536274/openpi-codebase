@@ -46,38 +46,38 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 
 ## train form pi05 official (pi05_base jax to torch)
 # CONFIG_NAME="${2:-libero10_pi05_alltasks_official}" 
-# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official}" 
+CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official}" 
 
 ## ki component ablation with pi05_base official model
 # CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_fast}" # ki_official_no_fast
-# resume : pi05_libero_20260421_214722
-CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_fast}"
-EXP_NAME="${3:-pi05_libero_20260421_214722}"
-RESUME="${4:-true}"
-EXTRA_TRAIN_ARGS=()
-# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_subtask}" # ki_official_no_subtask
-# resume : pi05_libero_20260421_215506
-CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_subtask}"
-EXP_NAME="${3:-pi05_libero_20260421_215506}"
-RESUME="${4:-true}"
-EXTRA_TRAIN_ARGS=()
-# resume : pi05_libero_20260421_215609
-# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_ki}" # ki_official_no_ki
-CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_ki}"
-EXP_NAME="${3:-pi05_libero_20260421_215609}"
-RESUME="${4:-true}"
-EXTRA_TRAIN_ARGS=()
-
-# # 参数 3: 实验名称
-# EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"
-# # 参数 4: 是否 resume（默认 false）
-# RESUME="${4:-false}"
-# # 额外透传给 train_pytorch.py 的参数。常用于 resume 时提高总步数。
-# # 示例:
-# # EXTRA_TRAIN_ARGS=(
-# #   --num_train_steps=40000
-# # )
+# resume : no_fast_continue
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_fast}"
+# EXP_NAME="${3:-pi05_libero_20260421_214722}"
+# RESUME="${4:-true}"
 # EXTRA_TRAIN_ARGS=()
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_subtask}" # ki_official_no_subtask
+# resume : no_subtask_continue
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_subtask}"
+# EXP_NAME="${3:-pi05_libero_20260421_215506}"
+# RESUME="${4:-true}"
+# EXTRA_TRAIN_ARGS=()
+# resume : no_ki_continue
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_ki}" # ki_official_no_ki
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_ki}"
+# EXP_NAME="${3:-pi05_libero_20260421_215609}"
+# RESUME="${4:-true}"
+# EXTRA_TRAIN_ARGS=()
+
+# 参数 3: 实验名称
+EXP_NAME="${3:-pi05_libero_$(date +%Y%m%d_%H%M%S)}"
+# 参数 4: 是否 resume（默认 false）
+RESUME="${4:-false}"
+# 额外透传给 train_pytorch.py 的参数。常用于 resume 时提高总步数。
+# 示例:
+# EXTRA_TRAIN_ARGS=(
+#   --num_train_steps=40000
+# )
+EXTRA_TRAIN_ARGS=()
 
 # continue training exp
 # CONFIG_NAME="${2:-libero10_pi05_alltasks}"

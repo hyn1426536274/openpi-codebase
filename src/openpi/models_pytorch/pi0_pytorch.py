@@ -202,12 +202,10 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
-    def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+    def embed_prefix_images(
+        self, images, img_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
+        """Embed only the image prefix so it can be reused across KI branches."""
         embs = []
         pad_masks = []
         att_masks = []
@@ -228,6 +226,27 @@ class PI0Pytorch(nn.Module):
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+
+        # Get batch size from the first dimension of the concatenated tensors
+        bsize = pad_masks.shape[0]
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        return embs, pad_masks, att_masks
+
+    def embed_prefix(
+        self, images, img_masks, lang_tokens, lang_masks, image_prefix=None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed images with SigLIP and language tokens with embedding layer to prepare
+        for PaliGemma transformer processing.
+        """
+        if image_prefix is None:
+            image_embs, image_pad_masks, image_att_masks = self.embed_prefix_images(images, img_masks)
+        else:
+            image_embs, image_pad_masks, image_att_masks = image_prefix
+
         # Process language tokens
         def lang_embed_func(lang_tokens):
             lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
@@ -236,20 +255,14 @@ class PI0Pytorch(nn.Module):
 
         lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-
-        # full attention between image and language inputs
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-
-        # Get batch size from the first dimension of the concatenated tensors
-        bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        embs = torch.cat([image_embs, lang_emb], dim=1)
+        pad_masks = torch.cat([image_pad_masks, lang_masks], dim=1)
+        lang_att_masks = torch.zeros(
+            (pad_masks.shape[0], lang_emb.shape[1]),
+            dtype=image_att_masks.dtype,
+            device=pad_masks.device,
+        )
+        att_masks = torch.cat([image_att_masks, lang_att_masks], dim=1)
 
         return embs, pad_masks, att_masks
 
@@ -341,6 +354,11 @@ class PI0Pytorch(nn.Module):
         """
         loss = defaultdict(float)
 
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        shared_image_prefix = None
+        if self.pi05_ki:
+            shared_image_prefix = self.embed_prefix_images(images, img_masks)
+
         # PI05_KI: compute language model losses first (subtask + fast AR)
         knowledge_isolation = False
         if self.pi05_ki:
@@ -355,9 +373,7 @@ class PI0Pytorch(nn.Module):
             # Language model losses (subtask + fast): only compute when at least one is enabled
             need_lm = self.enable_fast_loss or self.enable_subtask_loss
             if need_lm and has_lm_inputs:
-                loss.update(self.forward_language_model(observation))
-
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+                loss.update(self.forward_language_model(observation, images, img_masks, shared_image_prefix))
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -369,7 +385,9 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, image_prefix=shared_image_prefix
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -422,7 +440,7 @@ class PI0Pytorch(nn.Module):
             return loss
         return flow_loss
 
-    def forward_language_model(self, observation) -> dict:
+    def forward_language_model(self, observation, images, img_masks, shared_image_prefix=None) -> dict:
         """Compute autoregressive token losses (subtask + fast) for PI05_KI training.
 
         Both losses are cross-entropy AR losses over the respective token sequences.
@@ -430,7 +448,6 @@ class PI0Pytorch(nn.Module):
         Respects self.enable_subtask_loss / self.enable_fast_loss switches — skips
         embedding, forward pass, and loss computation for disabled branches.
         """
-        images, img_masks, _lang_tokens, _lang_masks, _state = self._preprocess_observation(observation, train=True)
         losses = {}
 
         def forward_func(prefix_embs, att_2d_masks_4d, position_ids):
@@ -467,7 +484,11 @@ class PI0Pytorch(nn.Module):
             subtask_token_loss_mask       = observation.subtask_token_loss_mask
 
             subtask_prefix_embs, subtask_prefix_pad_masks, subtask_prefix_att_masks = self.embed_prefix(
-                images, img_masks, subtask_tokenized_prompt, subtask_tokenized_prompt_mask
+                images,
+                img_masks,
+                subtask_tokenized_prompt,
+                subtask_tokenized_prompt_mask,
+                image_prefix=shared_image_prefix,
             )
             if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
                 subtask_prefix_embs = subtask_prefix_embs.to(dtype=torch.bfloat16)
@@ -495,7 +516,11 @@ class PI0Pytorch(nn.Module):
             fast_token_loss_mask       = observation.fast_token_loss_mask
 
             fast_prefix_embs, fast_prefix_pad_masks, fast_prefix_att_masks = self.embed_prefix(
-                images, img_masks, fast_tokenized_prompt, fast_tokenized_prompt_mask
+                images,
+                img_masks,
+                fast_tokenized_prompt,
+                fast_tokenized_prompt_mask,
+                image_prefix=shared_image_prefix,
             )
             if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
                 fast_prefix_embs = fast_prefix_embs.to(dtype=torch.bfloat16)

@@ -739,7 +739,7 @@ def create_torch_data_loader_with_val(
         TorchDataLoader(
             val_ds,
             local_batch_size=val_batch_size,
-            shuffle=False,
+            shuffle=shuffle,
             num_workers=0,
             seed=seed,
             framework=framework,

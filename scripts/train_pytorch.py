@@ -194,19 +194,18 @@ def build_datasets(config: _config.TrainConfig):
 
 
 @torch.no_grad()
-def validate(model, val_loader, device, num_batches, action_loss_alpha=1.0, ar_loss_alpha=0.1):
+def validate(model, val_iter, device, num_batches, action_loss_alpha=1.0, ar_loss_alpha=0.1):
     """Compute validation loss without gradient updates.
 
-    Runs the model in eval mode on up to `num_batches` from val_loader,
+    Runs the model in eval mode on up to `num_batches` from val_iter,
     then restores train mode. Returns a dict of averaged val metrics.
     """
     model.eval()
     val_losses = defaultdict(list)
     print(f"[VALIDATE-DEBUG] Starting validation, num_batches={num_batches}", flush=True)
-    for i, (observation, actions) in enumerate(val_loader):
+    for i in range(num_batches):
         print(f"[VALIDATE-DEBUG] Got val batch {i}", flush=True)
-        if i >= num_batches:
-            break
+        observation, actions = next(val_iter)
         observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
         actions = actions.to(device).float()  # noqa: PLW2901
         losses = model(observation, actions)
@@ -668,6 +667,7 @@ def train_loop(config: _config.TrainConfig):
     start_time = time.time()
     infos = []  # Collect stats over log interval
     warned_other_grad_params = False
+    val_iter = iter(val_loader) if val_loader is not None else None
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
@@ -845,7 +845,7 @@ def train_loop(config: _config.TrainConfig):
                 raw_model = model.module if use_ddp else model
                 val_metrics = validate(
                     raw_model,
-                    val_loader,
+                    val_iter,
                     device,
                     config.val_batches,
                     action_loss_alpha=getattr(config.model, "action_loss_alpha", 1.0),

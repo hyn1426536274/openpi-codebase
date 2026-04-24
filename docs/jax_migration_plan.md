@@ -1,323 +1,568 @@
-# JAX 迁移计划：将 PI05_KI / FAST / Subtask / LIBERO 改动迁移到原版 JAX 训练链路
+# JAX 迁移计划（2026-04-24 重置版）
 
-> 目标：把当前已经在共享层和 PyTorch 侧落地的 `PI05_KI` / `FAST` / `Subtask` / `LIBERO v3` 相关改动，系统迁移到原版 JAX 训练入口 [`scripts/train.py`](/workspace/code/openpi-codebase/scripts/train.py)，并以 JAX 模型实现 [`src/openpi/models/pi0.py`](/workspace/code/openpi-codebase/src/openpi/models/pi0.py) 为主线完成训练支持。
+> 这份文档从今天开始作为 JAX 迁移的唯一计划文档。
 >
-> 工作方式约束：
-> - 先写计划，再逐步实施
-> - 每一步只改一小部分，优先单文件修改
-> - 每一步修改后必须做本步可验证检查
-> - 每一步完成后停下来，等确认再继续
+> 结论先写在最前面：
+> - Torch 侧设计暂时不动
+> - JAX 模型核心实现不再沿着 Torch 的 KI attention 方案继续堆补丁
+> - JAX 的 `compute_loss` / `forward` / KI 主干，改为参考 `openpi-comet-clean`
+> - JAX 的配置、日志、validation、prompt 组织方式，尽量和当前 Torch 训练链路保持一致
+> - 当前目标任务仍然是 LIBERO
 
 ---
 
-## 1. 当前状态梳理
+## 1. 迁移目标
 
-### 1.1 已经在共享层存在的改动
+这次迁移的目标不是“把 Torch 版 KI 原样翻译成 JAX”，而是分成两层来做：
 
-这些改动已经不再是 PyTorch 专属，JAX 迁移可以直接复用：
+### 1.1 核心层
 
-- `ModelType.PI05_KI` 已加入共享枚举，见 [`src/openpi/models/model.py`](/workspace/code/openpi-codebase/src/openpi/models/model.py)
-- `Observation` 已扩展 `subtask_*` 与 `fast_*` 两组 token 流字段，见 [`src/openpi/models/model.py`](/workspace/code/openpi-codebase/src/openpi/models/model.py)
-- `Pi0Config` 已有 `pi05_ki`、`enable_fast_loss`、`enable_subtask_loss`、`enable_ki_attention`，见 [`src/openpi/models/pi0_config.py`](/workspace/code/openpi-codebase/src/openpi/models/pi0_config.py)
-- `SubtaskTokenizer` 与 `TokenizeKIInputs` 已在共享 tokenizer / transforms 层存在，见 [`src/openpi/models/tokenizer.py`](/workspace/code/openpi-codebase/src/openpi/models/tokenizer.py) 和 [`src/openpi/transforms.py`](/workspace/code/openpi-codebase/src/openpi/transforms.py)
-- `ModelTransformFactory` 已经能为 `PI05_KI` 构造 `TokenizeKIInputs`，见 [`src/openpi/training/config.py`](/workspace/code/openpi-codebase/src/openpi/training/config.py)
-- `LeRobotLiberoSubtaskDataConfig`、task 过滤、`episodes_index`、真实 subtask 注入逻辑都已经在共享数据层，见 [`src/openpi/training/config.py`](/workspace/code/openpi-codebase/src/openpi/training/config.py) 和 [`src/openpi/training/data_loader.py`](/workspace/code/openpi-codebase/src/openpi/training/data_loader.py)
-- `libero_policy.py` 已认识 `PI05_KI` 并支持传入 `subtask`
+JAX 模型核心参考 `openpi-comet-clean`：
 
-### 1.2 仍然是 PyTorch-only 的能力
+- 用 cache-based KI，而不是继续走 Torch 当前那套 attention 级别的改写
+- 参考 `compute_loss_and_metrics(...)`
+- 参考 `embed_prefix_for_flow(...)`
+- 参考 `embed_prefix_for_fast(...)`
+- 参考 full-prefix forward 后 slice KV cache，再对 flow 分支做 suffix-only forward 的做法
 
-这些能力目前只在 PyTorch 模型或训练脚本中存在，是 JAX 迁移的主要缺口：
+### 1.2 外围行为层
 
-- `PI05_KI` 多 loss 前向：`action + subtask + fast`
-- `forward_language_model()` 的 subtask / fast AR loss 计算
-- `Knowledge Isolation` attention 路径
-- `generate_subtask()` 推理生成
-- `train_pytorch.py` 对多 loss 的汇总与日志
-- PyTorch 特有的 validation 实现
+JAX 对外行为尽量向 Torch 靠齐：
 
-### 1.3 当前 JAX 侧的真实状态
+- config 命名和开关
+- wandb metric 命名
+- grad / loss 日志习惯
+- validation 触发方式
+- LIBERO 的 prompt / subtask 组织语义
 
-- JAX 训练入口 [`scripts/train.py`](/workspace/code/openpi-codebase/scripts/train.py) 仍假设 `model.compute_loss(...)` 返回单个可直接 `mean` 的 loss 张量
-- JAX 模型 [`src/openpi/models/pi0.py`](/workspace/code/openpi-codebase/src/openpi/models/pi0.py) 仍只实现标准 `PI0/PI05` flow matching loss
-- JAX `compute_loss()` 当前没有 subtask/fast 语言建模支路，也没有 KI attention 控制
+### 1.3 明确非目标
 
-这意味着：
+下面这些不是本轮第一优先级：
 
-- 配置层和数据层已经具备大部分入口
-- 训练核心仍缺 JAX 模型实现与 JAX train loop 对多 loss 的适配
+- 不改 Torch 训练代码
+- 不把 Torch 的 KI attention 逻辑继续硬搬到 JAX
+- 不要求 JAX 先支持所有非 LIBERO 数据集
+- 不要求第一步就把 JAX 推理侧全部补齐
 
 ---
 
-## 2. 迁移原则
+## 2. 当前状态
 
-为了满足“每次只改一小部分、且每步可验证”，这次迁移遵循下面原则：
+### 2.1 `openpi-codebase` 当前 JAX 状态
 
-- 每一步只改一个文件
-- 每一步先做“让代码结构支持下一步”的最小改动，不追求一次完成完整功能
-- 先打通配置与接口，再做模型计算，再做训练日志，再做验证与推理
-- 每一步都必须有一个本地可执行或至少可静态检查的验证动作
+当前仓库里的 JAX 路径已经有一部分 KI 痕迹，但整体还是半成品。
+
+#### 模型
+
+文件：
+- `src/openpi/models/pi0.py`
+
+当前事实：
+
+- 已经读取了 `pi05_ki`
+- 已经保存了 `enable_fast_loss`
+- 已经保存了 `enable_subtask_loss`
+- 已经保存了 `enable_ki_attention`
+- `_compute_pi05_ki_losses(...)` 目前只返回 `{"action": ...}`
+- `compute_loss(...)` 在 `pi05_ki=True` 时，本质上还是只返回 action / flow loss
+
+也就是说：
+
+- JAX 现在还没有真正落地 LIBERO 所需的 `flow + fast + subtask`
+- 更没有落地 `openpi-comet-clean` 那种 cache-based KI 主干
+
+#### 训练入口
+
+文件：
+- `scripts/train.py`
+
+当前事实：
+
+- 仍然假设 `model.compute_loss(...)` 返回的是单个 loss tensor
+- 当前默认只记录：
+  - `loss`
+  - `grad_norm`
+  - `param_norm`
+- 没有和 Torch 对齐的 validation 逻辑
+- 也没有 `compute_loss_and_metrics(...)` 这条更适合 JAX 的多指标接口
+
+#### 共享 Observation / prompt 字段
+
+文件：
+- `src/openpi/models/model.py`
+- `src/openpi/transforms.py`
+
+当前事实：
+
+- 共享 `Observation` 里已经有：
+  - `tokenized_prompt`
+  - `tokenized_prompt_mask`
+  - `fast_*`
+  - `subtask_*`
+- 但还没有：
+  - `flow_tokenized_prompt`
+  - `flow_tokenized_prompt_mask`
+  - `flow_loss_mask`
+  - `is_vqa`
+
+这说明当前共享层更偏 Torch 的 KI 组织方式，不是 `openpi-comet-clean` 的 JAX 组织方式。
+
+#### validation 配置
+
+文件：
+- `src/openpi/training/config.py`
+
+当前事实：
+
+- 共享 `TrainConfig` 已经有：
+  - `log_interval`
+  - `val_ratio`
+  - `val_interval`
+  - `val_batches`
+- 这些字段已经足够表达 Torch 风格的 train/val 行为
+- 但当前 JAX `scripts/train.py` 还没有真正消费这套 validation 逻辑
+
+### 2.2 `openpi-comet-clean` 参考实现给出的方向
+
+参考文件：
+
+- `openpi-comet-clean/src/openpi/models/pi0.py`
+- `openpi-comet-clean/src/openpi/models/model.py`
+- `openpi-comet-clean/src/openpi/training/jax_train_step.py`
+
+关键点有四个：
+
+#### 1. KI 是 cache-level 的
+
+不是额外魔改 attention kernel，而是：
+
+- 先做一次 full-prefix forward
+- 拿到 full KV cache
+- slice 出 flow prefix 对应那一段
+- 对这段 cache `stop_gradient`
+- flow 分支只跑 suffix
+
+这是当前 JAX 迁移应该优先学习的核心设计。
+
+#### 2. `compute_loss_and_metrics(...)` 更适合 JAX
+
+`openpi-comet-clean` 不是只返回一个 loss，而是：
+
+- 主 loss
+- 外加一组 aux metrics
+
+这比当前 `openpi-codebase/scripts/train.py` 的“只会吃一个 loss tensor”更适合后续做：
+
+- 多分支 loss
+- wandb 细粒度日志
+- validation 对齐
+
+#### 3. flow prompt 和 language prompt 是显式分开的
+
+`openpi-comet-clean` 里把 flow prompt 单独做成：
+
+- `flow_tokenized_prompt`
+- `flow_tokenized_prompt_mask`
+
+这比在一个字段里混着塞不同语义更清楚，也更适合 KI。
+
+#### 4. 训练指标比当前 `openpi-codebase` 的 JAX 版本更完整
+
+参考 `jax_train_step.py` 可以看到它除了基础 loss 外，还会记录：
+
+- `update_norm`
+- `grad_param_ratio`
+- `update_param_ratio`
+- prompt token 长度统计
+- flow prompt 长度统计
+- flow 生效比例等
+
+这些很适合作为 JAX 迁移后的基础日志框架。
 
 ---
 
-## 3. 拆分后的实施顺序
+## 3. 新的总体设计
 
-下面顺序刻意偏保守，方便逐步验证。
+### 3.1 设计原则
 
-### Step 0. 写计划文档
+这次 JAX 迁移采用下面这个原则：
+
+- JAX 核心参考 `openpi-comet-clean`
+- Torch 保持不动
+- 共享层只做“向后兼容”的扩展
+- LIBERO 当前需要的行为优先
+- 不为了“和 Torch 实现细节完全一致”而牺牲 JAX 主干设计
+
+### 3.2 JAX 与 Torch 的职责边界
+
+#### Torch
+
+Torch 继续保持现在的实现和训练逻辑：
+
+- 现有 config
+- 现有 grouped grad
+- 现有 validation
+- 现有 prompt 组织
+- 现有推理路径
+
+#### JAX
+
+JAX 单独演进：
+
+- 主干 forward / compute_loss 用 `openpi-comet-clean` 风格
+- 训练入口改成能接 `compute_loss_and_metrics(...)`
+- 共享层增加 JAX 需要的可选字段，但不破坏 Torch
+
+### 3.3 Prompt 组织的目标口径
+
+当前最重要的是把 prompt 语义先固定下来，避免后面一边改模型一边改数据字段。
+
+对 JAX-LIBERO，建议采用下面的语义：
+
+- `tokenized_prompt`
+  - 保留为通用/兼容字段
+  - 继续服务非 KI 路径或旧逻辑
+- `flow_tokenized_prompt`
+  - JAX flow 分支专用
+  - 语义必须是 leakage-free prompt
+- `fast_tokenized_prompt`
+  - JAX / Torch 都可共用
+  - 表示 FAST 自回归监督序列
+- `subtask_tokenized_prompt`
+  - JAX / Torch 都可共用
+  - 表示 subtask 自回归监督序列
+
+这个设计的关键点是：
+
+- 不去重定义 Torch 已经在用的 `fast_*` / `subtask_*`
+- 只新增 JAX 真正缺的 `flow_*`
+- 让 flow prompt 不再偷用别的字段
+
+### 3.4 JAX 损失组织的目标口径
+
+对 LIBERO，JAX 迁移后的目标不是照抄 `openpi-comet-clean` 的 VQA 场景，而是借它的主干设计，输出更接近 Torch 的 loss 视图。
+
+目标日志口径建议如下：
+
+- `loss`
+  - 总 loss
+- `loss/action`
+  - flow / action 分支
+- `loss/fast`
+  - FAST 自回归分支
+- `loss/subtask`
+  - subtask 自回归分支
+
+如果后续调试确实需要，也可以额外保留 JAX 风格别名：
+
+- `loss_flow`
+- `loss_fast_raw`
+- `loss_subtask_raw`
+
+但主展示口径优先靠近 Torch。
+
+### 3.5 JAX validation 的目标口径
+
+validation 目标和当前 Torch 版本尽量一致：
+
+- 只有 `val_ratio > 0` 时启用
+- 使用 `val_interval`
+- 每次跑 `val_batches`
+- 每次 validation 单独平均，不和 train log interval 再做混合平均
+- wandb 中明确记录 `val/*` 或 `val_loss/*`
+
+---
+
+## 4. 分阶段迁移方案
+
+下面是新的执行顺序。后续真正改代码时，仍然遵循“每次只动一小块，改前确认”的原则。
+
+### Phase 0. 文档重置
 
 目标：
-- 在 `docs/` 中落地本计划
 
-修改文件：
+- 重写当前迁移计划
+- 明确旧计划过时
+- 把 JAX 目标从“跟着 Torch KI attention 走”切换到“核心参考 `openpi-comet-clean`”
+
+涉及文件：
+
 - `docs/jax_migration_plan.md`
-
-验证：
-- 回读文档，确认范围、顺序、单文件约束、验证方式都明确
+- `docs/jax_modify_history.md`
 
 状态：
-- 当前步骤
 
-### Step 1. 让 JAX 模型显式识别 `pi05_ki`
+- 当前阶段
+
+### Phase 1. 固定共享字段和 LIBERO prompt 合约
 
 目标：
-- 在 JAX 模型 [`src/openpi/models/pi0.py`](/workspace/code/openpi-codebase/src/openpi/models/pi0.py) 中先把 `config.pi05_ki` 纳入实例状态
-- 但这一阶段先不引入新 loss，只做状态对齐，为后续分支留入口
 
-修改文件：
+- 在不影响 Torch 的前提下，把 JAX 需要的字段补齐
+- 把 LIBERO 下各 prompt 字段的语义完全写死
+
+建议动作：
+
+- 在共享 `Observation` 中补可选字段：
+  - `flow_tokenized_prompt`
+  - `flow_tokenized_prompt_mask`
+  - `flow_loss_mask`
+  - `is_vqa`
+- 对 LIBERO 先约定默认行为：
+  - `flow_loss_mask=True`
+  - `is_vqa=False`
+- 重新整理 JAX 要用的 transforms / tokenizer 输出口径
+
+涉及文件候选：
+
+- `src/openpi/models/model.py`
+- `src/openpi/transforms.py`
+- `src/openpi/models/tokenizer.py`
+
+完成标准：
+
+- Torch 侧现有数据流不被破坏
+- JAX 所需字段齐备
+- 文档中对每个 prompt 字段的语义没有歧义
+
+### Phase 2. 先迁移 JAX 模型核心，再谈优化
+
+目标：
+
+- 把 `src/openpi/models/pi0.py` 的 action / flow 主干改成 `openpi-comet-clean` 风格
+
+优先迁移的内容：
+
+- `_embed_visual_prefix(...)`
+- `embed_prefix_for_flow(...)`
+- full-prefix LM forward
+- KV cache slicing
+- `stop_gradient`
+- suffix-only flow forward
+- `compute_loss_and_metrics(...)`
+
+注意：
+
+- 这一阶段先把 JAX 核心主干改对
+- 不急着一口气把所有 LIBERO 分支都塞进去
+- 先保证 `loss/action` 路径是干净、稳定、可解释的
+
+涉及文件：
+
 - `src/openpi/models/pi0.py`
 
-预期改动：
-- `self.pi05 = config.pi05 or config.pi05_ki`
-- 保存 `self.pi05_ki`
-- 保存 `enable_fast_loss` / `enable_subtask_loss` / `enable_ki_attention`
+完成标准：
 
-验证：
-- 运行一次静态搜索，确认字段已被 JAX 模型使用
-- 运行最小导入检查，确认 `Pi0Config(pi05_ki=True).create(...)` 不报错
+- JAX `compute_loss` 可以作为 `compute_loss_and_metrics` 的包装
+- action / flow 路径确实是 cache-based KI
+- Torch 不受影响
 
-### Step 2. 为 JAX 模型补一个“多 loss 返回接口”，先不改 train loop
+### Phase 3. 在新的 JAX 主干上接回 LIBERO 的 fast / subtask 分支
 
 目标：
-- 先在 JAX 模型中新增一个内部辅助接口，例如 `_compute_pi05_ki_losses(...)`
-- 暂时允许它只返回 `{"action": flow_loss}`，先建立结构
 
-修改文件：
+- 以新的 JAX 核心为底座，恢复 LIBERO 所需的多分支训练
+
+建议顺序：
+
+1. 先接 `loss/action`
+2. 再接 `loss/fast`
+3. 最后接 `loss/subtask`
+
+原因：
+
+- action / flow 是主干
+- fast 更接近 `openpi-comet-clean` 已有的 language loss 结构
+- subtask 是 LIBERO 特有附加分支，最后接最稳
+
+重要约束：
+
+- 尽量不要把三条分支写成互相缠绕的复杂逻辑
+- 先保证每条分支单独可读，再做共享前缀优化
+
+涉及文件：
+
 - `src/openpi/models/pi0.py`
 
-预期改动：
-- 增加内部 helper
-- `compute_loss()` 暂时保持兼容，仍返回单 loss，避免一次改太大
+完成标准：
 
-验证：
-- 最小 shape 检查：fake obs / fake act 跑 `compute_loss()` 仍返回原 shape
-- 新 helper 可被调用并返回 dict
+- `compute_loss_and_metrics(...)` 能稳定返回总 loss 和分支指标
+- 输出指标至少包括：
+  - `loss/action`
+  - `loss/fast`
+  - `loss/subtask`
 
-### Step 3. 让 JAX train loop 能接收 dict loss
+### Phase 4. 对齐 JAX 的 grad / loss / wandb 日志
 
 目标：
-- 修改 [`scripts/train.py`](/workspace/code/openpi-codebase/scripts/train.py)，使其兼容：
-  - 标量/张量 loss
-  - dict 多 loss
 
-修改文件：
+- 把 JAX 训练日志从“只有 `loss`/`grad_norm`/`param_norm`”提升到可用状态
+- 同时尽量靠近 Torch 的可读性
+
+建议动作：
+
+- 让 JAX train loop 接 `compute_loss_and_metrics(...)`
+- 保留基础字段：
+  - `loss`
+  - `grad_norm`
+  - `param_norm`
+- 增加分支 loss：
+  - `loss/action`
+  - `loss/fast`
+  - `loss/subtask`
+- 参考 `openpi-comet-clean` 增加辅助统计：
+  - `update_norm`
+  - `grad_param_ratio`
+  - `update_param_ratio`
+  - prompt 长度统计
+
+暂不承诺的项：
+
+- Torch 那套 grouped grad norm 不作为第一阶段阻塞项
+- 如果要做，也放在主干稳定之后，再单独设计 JAX 参数分组口径
+
+涉及文件：
+
 - `scripts/train.py`
+- 视情况可抽公共 helper，但第一步不强求拆文件
 
-预期改动：
-- `loss_fn` 不再强依赖 `jnp.mean(chunked_loss)` 的单一路径
-- 当模型返回 dict 时：
-  - 聚合出总 loss
-  - 单独记录 `loss/action`、`loss/subtask`、`loss/fast`
-- 训练日志先和 PyTorch 保持命名对齐
+完成标准：
 
-验证：
-- 静态检查 `train_step()` 的返回 `info` 中含多 loss 字段
-- 用 fake batch 跑一次最小 JIT 编译，确认不会因为返回 dict 结构报错
+- wandb 能看到总 loss 和分支 loss
+- 日志平均方式清晰，不混淆 train / val
 
-### Step 4. 在 JAX 模型中正式引入 `PI05_KI` 的 action loss 分支
+### Phase 5. 把 JAX validation 接回当前共享 config 口径
 
 目标：
-- 让 `compute_loss()` 在 `pi05_ki=True` 时先走 dict 路径，但初期仍只包含 `action`
-- 这一步的目的是让 train.py + pi0.py 的 dict 接口真正打通
 
-修改文件：
-- `src/openpi/models/pi0.py`
+- 让 JAX 真正使用当前共享 `TrainConfig` 里已有的：
+  - `val_ratio`
+  - `val_interval`
+  - `val_batches`
 
-预期改动：
-- `compute_loss()` 在 `pi05_ki=True` 时返回 `{"action": ...}` 风格的可聚合结果
+要求：
 
-验证：
-- 最小训练步 smoke test
-- 观察 `train.py` 中 `loss/action` 是否能正常产生
+- validation 与 train 的调用链分清楚
+- val 指标只在 validation run 内平均
+- 不把单次 val 结果错误地和 train log interval 再做二次平均
 
-### Step 5. 把 subtask AR loss 迁移到 JAX
+涉及文件候选：
 
-目标：
-- 在 JAX 模型里实现 subtask token 流的 prefix-LM loss
-
-修改文件：
-- `src/openpi/models/pi0.py`
-
-预期改动：
-- 读取 `observation.subtask_*`
-- 复用已有 tokenizer 产物
-- 构造 masked CE loss
-- 按 `enable_subtask_loss` 开关控制
-
-验证：
-- fake batch 下 subtask loss 分支 shape 正确
-- 当关闭 `enable_subtask_loss=False` 时，该项不存在或为零
-
-### Step 6. 把 FAST AR loss 迁移到 JAX
-
-目标：
-- 在 JAX 模型里实现 fast token 流的 AR loss
-
-修改文件：
-- `src/openpi/models/pi0.py`
-
-预期改动：
-- 读取 `observation.fast_*`
-- 构造 masked CE loss
-- 按 `enable_fast_loss` 开关控制
-
-验证：
-- fake batch 下 fast loss 可计算
-- 关闭 `enable_fast_loss=False` 时，该项不存在或为零
-
-### Step 7. 在 JAX train loop 中支持总 loss 权重和完整日志
-
-目标：
-- 若需要，补齐 `loss/total`
-- 与 PyTorch 命名对齐，便于横向比较
-
-修改文件：
 - `scripts/train.py`
+- `src/openpi/training/data_loader.py`
+- 若需要，补 JAX 侧可复用的 val loader 创建逻辑
 
-预期改动：
-- `wandb.log` 增加 `loss/total`、`loss/action`、`loss/subtask`、`loss/fast`
-- 保持现有 `grad_norm` / `param_norm`
+完成标准：
 
-验证：
-- 检查 `reduced_info` 字段是否齐全
-- 最小训练步下日志字典可序列化
+- 能周期性产出稳定的 `val` 指标
+- 口径与 Torch 当前配置语义一致
 
-### Step 8. 迁移 JAX 侧 Knowledge Isolation
-
-目标：
-- 在 JAX attention 实现中加入 KI 机制
-
-修改文件：
-- 优先候选：`src/openpi/models/gemma.py`
-
-说明：
-- 这是高风险步骤，也是整次迁移最难的一步
-- 必须先读清 JAX Gemma 的 attention 结构后再动手
-- 很可能需要拆成多个更小步骤；如果发现必须涉及第二个文件，需要先停下来确认
-
-验证：
-- 编译通过
-- 在 `enable_ki_attention=False/True` 时前向都可运行
-- 至少做一个梯度流向的 sanity check
-
-### Step 9. 为 JAX 训练补 validation
+### Phase 6. 补 JAX 的 LIBERO 专用 config，并与 Torch 命名尽量对齐
 
 目标：
-- 把当前 PyTorch 训练里有而 JAX 训练里没有的 validation 逻辑迁回 JAX 入口
 
-修改文件：
-- `scripts/train.py`
+- 给 JAX 增加当前 LIBERO 需要的 config 入口
+- 和 Torch 版本的实验命名、开关含义尽量一致
 
-说明：
-- 这一步不一定要立即做，取决于你是否把 JAX train/val 作为第一阶段刚需
-- 数据层已有 `create_torch_data_loader_with_val()`，但 JAX 目前训练链路不直接消费它，需要重新设计
+原则：
 
-验证：
-- 可以周期性产出 `val_loss/*`
-- 明确 train/val 口径一致
+- 开关名尽量复用已有字段
+- 不为了“完全一样”去扭曲 JAX 主干
+- config 负责表达实验，不负责承载模型 hack
 
-### Step 10. JAX 推理侧是否支持 `generate_subtask()`
+涉及文件：
 
-目标：
-- 评估是否要把 PyTorch-only 的 `generate_subtask()` 推到 JAX
+- `src/openpi/training/config.py`
 
-说明：
-- 这一步不是训练阻塞项
-- 目前 auto-subtask 明确是 PyTorch-only，JAX 可以先不做
+完成标准：
 
-验证：
-- 若做，则需最小推理 smoke test
-- 若不做，则在文档中明确“JAX 训练支持，JAX 推理暂不支持 auto_subtask”
+- JAX 有独立的 LIBERO config
+- 语义和 Torch 当前实验保持可对照
 
----
+### Phase 7. 最后再决定是否补 JAX 推理闭环
 
-## 4. 建议的每步验证模板
+这一步不是当前训练迁移的阻塞项。
 
-为了保证每一步都能停下来检查，建议固定采用下面模板：
+可选内容：
 
-1. 静态检查
-- `rg` 确认新字段/新分支已接入目标路径
+- JAX `sample_actions(...)` 路径继续对齐 `openpi-comet-clean`
+- 是否需要 JAX 侧 `generate_subtask()`
 
-2. 最小导入检查
-- 能 import 对应模块
-- dataclass/config 构造不报错
+当前建议：
 
-3. 最小 shape/smoke test
-- 用 fake obs / fake act 跑一小步前向
-- 若涉及 train loop，则跑单 step 或最小 JIT
-
-4. 结果回报
-- 说明本步改了什么
-- 说明验证通过了什么
-- 说明下一步准备做什么
-- 然后停下来等待确认
+- 先把训练链路做好
+- 推理闭环单独开下一轮
 
 ---
 
-## 5. 风险评估
+## 5. 当前推荐的实际执行顺序
 
-### 低风险
+如果下一步要开始动代码，建议按这个顺序做：
 
-- 配置和共享数据层
-- train.py 的多 loss 日志适配
-- JAX 模型保存 `pi05_ki` / loss 开关状态
+1. 先做 Phase 1：补共享字段，固定 prompt 合约
+2. 再做 Phase 2：把 JAX `pi0.py` 的 flow 主干切到 `openpi-comet-clean` 风格
+3. 再做 Phase 3：补回 fast / subtask
+4. 然后做 Phase 4：整理 JAX train 日志
+5. 然后做 Phase 5：接 validation
+6. 最后做 Phase 6：补 JAX LIBERO configs
 
-### 中风险
+这个顺序的原因很简单：
 
-- JAX subtask / FAST token loss 接入
-- JAX train loop 的多 loss JIT 返回结构
+- 先固定输入和字段语义
+- 再改最核心的模型计算
+- 最后再处理日志和训练外围
 
-### 高风险
+否则很容易出现：
 
-- JAX Knowledge Isolation attention
-- JAX `generate_subtask()` 推理能力
-
----
-
-## 6. 第一阶段完成标准
-
-如果先做一个“可训练版本”的 JAX 迁移，建议第一阶段完成标准是：
-
-- `scripts/train.py` 可以跑 `pi05_ki` 配置
-- JAX 模型能计算 `loss/action`、`loss/subtask`、`loss/fast`
-- `wandb` 中能看到这些 loss
-- 数据层正确读到真实 subtask 数据
-- 暂不要求 JAX 推理支持 `generate_subtask()`
-- 暂不要求第一阶段就完成 KI attention，前提是文档中明确这一点
-
-这会得到一个“JAX 版联合训练框架”，然后第二阶段再补 KI attention 与推理闭环。
+- prompt 语义还没定
+- 模型已经改了一半
+- 日志字段又开始漂移
 
 ---
 
-## 7. 当前建议的下一步
+## 6. 风险与注意事项
 
-按你的要求，下一步只改一个文件，建议从这里开始：
+### 6.1 最大风险不是“少一个 if”，而是接口语义混乱
 
-- **下一步建议：Step 1，只修改 [`src/openpi/models/pi0.py`](/workspace/code/openpi-codebase/src/openpi/models/pi0.py)**
+真正高风险的地方不是某个 loss 少算了，而是下面这些：
 
-理由：
+- 同一个字段在 Torch 和 JAX 里表示不同语义
+- flow prompt 和 language prompt 混用
+- train / val 的平均口径不一致
+- 总 loss 和分支 loss 的记录口径漂移
 
-- 风险最低
-- 不会立刻影响训练脚本
-- 能先把 JAX 模型状态与现有共享配置对齐
-- 改完后可以立刻做最小导入验证
+所以这次迁移第一步必须先把接口定义好。
 
+### 6.2 subtask 分支不要一开始就过度优化
+
+`openpi-comet-clean` 给的是 flow + language 主干参考，但 LIBERO 还有 subtask 分支。
+
+这里更稳妥的做法是：
+
+- 先把 subtask 当成独立、清晰的一条 JAX LM 分支接回来
+- 确认行为正确后，再讨论是否和 fast 分支进一步共享更多计算
+
+### 6.3 grouped grad 不要抢在主干之前做
+
+Torch 当前 grouped grad 是有价值的，但它不是 JAX 主干迁移的第一阻塞项。
+
+优先级应该是：
+
+1. 核心 forward / compute_loss 正确
+2. train / val 口径清楚
+3. 分支日志可读
+4. 再决定是否做 JAX grouped grad
+
+---
+
+## 7. 当前结论
+
+从今天开始，JAX 迁移按下面这句话执行：
+
+> JAX 核心跟 `openpi-comet-clean`，JAX 外围行为尽量对齐 Torch，Torch 本身不动，当前只服务 LIBERO。
+
+下一步如果开始改代码，第一步不应该再去碰 JAX KI attention 细节，而应该先做：
+
+- 共享字段补齐
+- prompt 合约固定
+- 然后再改 JAX `pi0.py`

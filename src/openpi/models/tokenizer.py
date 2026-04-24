@@ -120,7 +120,7 @@ class FASTTokenizer:
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        cleaned_text = prompt.lower().strip().replace("_", " ")
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
