@@ -119,6 +119,10 @@ class Observation(Generic[ArrayT]):
     fast_token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     fast_token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Torch PI05_KI training-only batch routing mode.
+    # 0=all, 1=fast_flow, 2=subtask.
+    ki_task_mode: at.Int[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -147,6 +151,7 @@ class Observation(Generic[ArrayT]):
             fast_tokenized_prompt_mask=data.get("fast_tokenized_prompt_mask"),
             fast_token_ar_mask=data.get("fast_token_ar_mask"),
             fast_token_loss_mask=data.get("fast_token_loss_mask"),
+            ki_task_mode=data.get("ki_task_mode"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -234,6 +239,7 @@ def preprocess_observation(
         fast_tokenized_prompt_mask=observation.fast_tokenized_prompt_mask,
         fast_token_ar_mask=observation.fast_token_ar_mask,
         fast_token_loss_mask=observation.fast_token_loss_mask,
+        ki_task_mode=observation.ki_task_mode,
     )
 
 

@@ -170,9 +170,9 @@ def build_datasets(config: _config.TrainConfig):
 
     print(f"[BUILD-DEBUG] val_ratio={config.val_ratio}, repo_id={getattr(config.data, 'repo_id', 'fake')}", flush=True)
     if config.val_ratio > 0 and getattr(config.data, "repo_id", "fake") != "fake":
-        print(f"[BUILD-DEBUG] Taking val split path...", flush=True)
+        print("[BUILD-DEBUG] Taking val split path...", flush=True)
         data_config = config.data.create(config.assets_dirs, config.model)
-        print(f"[BUILD-DEBUG] data_config created, calling create_torch_data_loader_with_val...", flush=True)
+        print("[BUILD-DEBUG] data_config created, calling create_torch_data_loader_with_val...", flush=True)
         train_loader, val_loader = _data.create_torch_data_loader_with_val(
             data_config,
             model_config=config.model,
@@ -185,11 +185,11 @@ def build_datasets(config: _config.TrainConfig):
             framework="pytorch",
             episodes=debug_eps,
         )
-        print(f"[BUILD-DEBUG] Val split done, returning train + val loaders", flush=True)
+        print("[BUILD-DEBUG] Val split done, returning train + val loaders", flush=True)
         return train_loader, data_config, val_loader
-    print(f"[BUILD-DEBUG] Taking standard path (no val)...", flush=True)
+    print("[BUILD-DEBUG] Taking standard path (no val)...", flush=True)
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True, episodes=debug_eps)
-    print(f"[BUILD-DEBUG] Standard loader created", flush=True)
+    print("[BUILD-DEBUG] Standard loader created", flush=True)
     return data_loader, data_loader.data_config(), None
 
 
@@ -207,6 +207,12 @@ def validate(model, val_iter, device, num_batches, action_loss_alpha=1.0, ar_los
         print(f"[VALIDATE-DEBUG] Got val batch {i}", flush=True)
         observation, actions = next(val_iter)
         observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+        if hasattr(observation, "ki_task_mode"):
+            batch_size = observation.state.shape[0]
+            observation = dataclasses.replace(
+                observation,
+                ki_task_mode=torch.zeros(batch_size, dtype=torch.int64, device=device),
+            )
         actions = actions.to(device).float()  # noqa: PLW2901
         losses = model(observation, actions)
         if isinstance(losses, dict):
@@ -538,7 +544,7 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
-    print(f"[TRAIN-DEBUG] Calling build_datasets...", flush=True)
+    print("[TRAIN-DEBUG] Calling build_datasets...", flush=True)
     loader, data_config, val_loader = build_datasets(config)
     print(f"[TRAIN-DEBUG] build_datasets done. val_loader={'present' if val_loader else 'None'}", flush=True)
     # HACK: skip sampling images for wandb, it takes too mush time.
@@ -619,7 +625,7 @@ def train_loop(config: _config.TrainConfig):
             device_ids=[device.index] if device.type == "cuda" else None,
             find_unused_parameters=True,  # Disable for memory efficiency
             gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            static_graph=(world_size >= 8 and config.ki_batch_routing != "split"),  # Split KI routing changes active graph
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
@@ -709,6 +715,24 @@ def train_loop(config: _config.TrainConfig):
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            if getattr(config.model, "pi05_ki", False) and config.ki_batch_routing == "split":
+                can_run_fast_flow = getattr(config.model, "enable_fast_loss", True) or getattr(config.model, "action_loss_alpha", 1.0) > 0
+                can_run_subtask = getattr(config.model, "enable_subtask_loss", True) and getattr(config.model, "ar_loss_alpha", 0.1) > 0
+                if can_run_fast_flow and can_run_subtask:
+                    batch_rng = np.random.RandomState(config.seed + global_step)
+                    ki_task_mode_id = 2 if batch_rng.rand() < config.ki_subtask_batch_ratio else 1
+                elif can_run_subtask:
+                    ki_task_mode_id = 2
+                else:
+                    ki_task_mode_id = 1
+            else:
+                ki_task_mode_id = 0
+            if hasattr(observation, "ki_task_mode"):
+                batch_size = observation.state.shape[0]
+                observation = dataclasses.replace(
+                    observation,
+                    ki_task_mode=torch.full((batch_size,), ki_task_mode_id, dtype=torch.int64, device=device),
+                )
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
@@ -729,13 +753,14 @@ def train_loop(config: _config.TrainConfig):
                 action_loss_alpha = getattr(config.model, "action_loss_alpha", 1.0)
                 ar_loss_alpha = getattr(config.model, "ar_loss_alpha", 0.1)
                 loss = (
-                    action_loss_alpha * losses["action"]
+                    action_loss_alpha * losses.get("action", torch.tensor(0.0, device=device))
                     + ar_loss_alpha * losses.get("subtask", torch.tensor(0.0, device=device))
                     + ar_loss_alpha * losses.get("fast", torch.tensor(0.0, device=device))
                 )
                 per_loss_dict = {f"loss/{k}": v.item() for k, v in losses.items()}
                 per_loss_dict["loss/action_loss_alpha"] = action_loss_alpha
                 per_loss_dict["loss/ar_loss_alpha"] = ar_loss_alpha
+                per_loss_dict["ki_task_mode"] = ki_task_mode_id
             elif isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
                 loss = losses.mean()
@@ -824,9 +849,18 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
                     # Log per-loss breakdown (loss/action, loss/subtask, loss/fast) for PI05_KI
-                    sub_loss_keys = [k for k in infos[0] if k.startswith("loss/")]
+                    sub_loss_keys = sorted({k for info in infos for k in info if k.startswith("loss/")})
                     for k in sub_loss_keys:
-                        log_payload[k] = sum(info[k] for info in infos) / len(infos)
+                        vals = [info[k] for info in infos if k in info]
+                        if vals:
+                            log_payload[k] = sum(vals) / len(vals)
+                    if any("ki_task_mode" in info for info in infos):
+                        subtask_batches = sum(1 for info in infos if info.get("ki_task_mode") == 2)
+                        fast_flow_batches = sum(1 for info in infos if info.get("ki_task_mode") == 1)
+                        all_batches = sum(1 for info in infos if info.get("ki_task_mode") == 0)
+                        log_payload["ki_batches/subtask"] = subtask_batches
+                        log_payload["ki_batches/fast_flow"] = fast_flow_batches
+                        log_payload["ki_batches/all"] = all_batches
                     for k, v in grouped_grad_means.items():
                         log_payload[k] = v
                     wandb.log(log_payload, step=global_step)

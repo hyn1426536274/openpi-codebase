@@ -181,13 +181,17 @@ class ModelTransformFactory(GroupFactory):
                     if model_config.fast_model_tokenizer_kwargs is None
                     else model_config.fast_model_tokenizer_kwargs
                 )
+                tokenizer_kwargs = {**tokenizer_kwargs, "action_label_in_prefix": True}
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizeKIInputs(
                             fast_tokenizer=tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
-                            subtask_tokenizer=_tokenizer.SubtaskTokenizer(model_config.max_token_len),
+                            subtask_tokenizer=_tokenizer.SubtaskTokenizer(
+                                model_config.max_token_len,
+                                subtask_label_in_prefix=True,
+                            ),
                             paligemma_tokenizer=_tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
@@ -628,6 +632,13 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # KI training routing strategy:
+    # - "all": every batch computes all enabled losses (existing behavior)
+    # - "split": each batch computes either subtask-only or fast/flow-only
+    ki_batch_routing: Literal["all", "split"] = "all"
+    # When ki_batch_routing="split", probability of sampling a subtask-only batch.
+    # The remaining probability is assigned to fast/flow batches.
+    ki_subtask_batch_ratio: float = 0.5
     # If true, log grouped gradient norms for KI debugging.
     log_grouped_grad_norms: bool = False
     # How often (in steps) to save checkpoints.
@@ -685,6 +696,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if not 0.0 <= self.ki_subtask_batch_ratio <= 1.0:
+            raise ValueError("ki_subtask_batch_ratio must be in [0, 1].")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -1089,6 +1102,43 @@ _CONFIGS = [
         checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
         log_grouped_grad_norms=True,
         num_train_steps=100000,
+        num_workers=4,
+        log_interval=50,
+        val_ratio=0.1,
+        val_interval=50,
+        val_batches=2,
+        save_interval=5000,
+    ),
+    TrainConfig(
+        name="libero10_pi05ki_alltasks_official_split",
+        project_name="pi05_research",
+        model=pi0_config.Pi0Config(
+            pi05_ki=True,
+            action_horizon=10,
+            fast_model_tokenizer_kwargs={"fast_tokenizer_path": "/workspace/data/pi_models/fast-action-tokenizer"},
+        ),
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="/workspace/data/libero/libero_10_subtasks_fixed",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32*2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path="/workspace/data/pi_official_models/torch/pi05_base",
+        checkpoint_base_dir="/workspace/data/ki_output/ckpts_torch",
+        log_grouped_grad_norms=True,
+        ki_batch_routing="split",
+        ki_subtask_batch_ratio=0.5,
+        num_train_steps=100,
         num_workers=4,
         log_interval=50,
         val_ratio=0.1,

@@ -142,20 +142,38 @@ class PI0Pytorch(nn.Module):
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        checkpoint_kwargs = {"use_reentrant": False, "preserve_rng_state": False}
+        self._set_module_gradient_checkpointing(
+            self.paligemma_with_expert.paligemma.language_model, enabled=True, checkpoint_kwargs=checkpoint_kwargs
+        )
+        self._set_module_gradient_checkpointing(
+            self.paligemma_with_expert.paligemma.vision_tower, enabled=True, checkpoint_kwargs=checkpoint_kwargs
+        )
+        self._set_module_gradient_checkpointing(
+            self.paligemma_with_expert.gemma_expert.model, enabled=True, checkpoint_kwargs=checkpoint_kwargs
+        )
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        self._set_module_gradient_checkpointing(self.paligemma_with_expert.paligemma.language_model, enabled=False)
+        self._set_module_gradient_checkpointing(self.paligemma_with_expert.paligemma.vision_tower, enabled=False)
+        self._set_module_gradient_checkpointing(self.paligemma_with_expert.gemma_expert.model, enabled=False)
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
+
+    def _set_module_gradient_checkpointing(self, module, *, enabled: bool, checkpoint_kwargs: dict | None = None):
+        if enabled and hasattr(module, "gradient_checkpointing_enable"):
+            module.gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs)
+            return
+        if not enabled and hasattr(module, "gradient_checkpointing_disable"):
+            module.gradient_checkpointing_disable()
+            return
+
+        if hasattr(module, "gradient_checkpointing"):
+            module.gradient_checkpointing = enabled
 
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
@@ -176,6 +194,29 @@ class PI0Pytorch(nn.Module):
         dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
         device = att_2d_masks_4d.device
         return torch.where(att_2d_masks_4d, torch.zeros(1, dtype=dtype, device=device), torch.full((1,), -2.3819763e38, dtype=dtype, device=device))
+
+    def _token_ar_loss_from_hidden(self, hidden, tokenized_prompt, token_loss_mask):
+        """Compute masked AR CE after selecting supervised positions.
+
+        This is equivalent to computing logits for every text token and masking the
+        loss afterwards, but avoids sending unsupervised prompt positions through
+        the large vocabulary projection.
+        """
+        text_hidden = hidden[:, -tokenized_prompt.shape[1] :, :]
+        pred_hidden = text_hidden[:, :-1, :]
+        labels = tokenized_prompt[:, 1:]
+        loss_mask = token_loss_mask[:, 1:].bool()
+        selected_hidden = pred_hidden[loss_mask]
+        selected_labels = labels[loss_mask]
+
+        if selected_labels.numel() == 0:
+            return selected_hidden.sum() * 0.0
+
+        selected_logits = self._apply_checkpoint(
+            lambda x: self.paligemma_with_expert.paligemma.lm_head(x),
+            selected_hidden,
+        )
+        return F.cross_entropy(selected_logits, selected_labels)
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -353,15 +394,35 @@ class PI0Pytorch(nn.Module):
           - PI05_KI mode: dict with keys "action", "subtask", "fast"
         """
         loss = defaultdict(float)
+        task_mode = "all"
+        raw_task_mode = getattr(observation, "ki_task_mode", None)
+        if raw_task_mode is not None:
+            if isinstance(raw_task_mode, torch.Tensor):
+                if raw_task_mode.numel() == 0:
+                    raise ValueError("ki_task_mode tensor is empty.")
+                task_mode_id = int(raw_task_mode.reshape(-1)[0].item())
+            else:
+                task_mode_id = int(raw_task_mode)
+            task_mode_map = {0: "all", 1: "fast_flow", 2: "subtask"}
+            if task_mode_id not in task_mode_map:
+                raise ValueError(f"Unsupported ki_task_mode: {task_mode_id}")
+            task_mode = task_mode_map[task_mode_id]
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(
+            observation, train=self.training
+        )
         shared_image_prefix = None
         if self.pi05_ki:
             shared_image_prefix = self.embed_prefix_images(images, img_masks)
 
         # PI05_KI: compute language model losses first (subtask + fast AR)
         knowledge_isolation = False
+        joint_fast_flow = False
         if self.pi05_ki:
+            compute_subtask_loss = self.enable_subtask_loss and task_mode in ("all", "subtask")
+            compute_fast_loss = self.enable_fast_loss and task_mode in ("all", "fast_flow")
+            compute_action_loss = task_mode in ("all", "fast_flow")
+
             # KI attention switch: only pass knowledge_isolation=True when enabled
             has_lm_inputs = (
                 observation.fast_tokenized_prompt is not None
@@ -369,11 +430,23 @@ class PI0Pytorch(nn.Module):
             )
             if self.enable_ki_attention and has_lm_inputs:
                 knowledge_isolation = True
+                joint_fast_flow = compute_fast_loss and compute_action_loss
 
             # Language model losses (subtask + fast): only compute when at least one is enabled
-            need_lm = self.enable_fast_loss or self.enable_subtask_loss
+            need_lm = compute_fast_loss or compute_subtask_loss
             if need_lm and has_lm_inputs:
-                loss.update(self.forward_language_model(observation, images, img_masks, shared_image_prefix))
+                loss.update(
+                    self.forward_language_model(
+                        observation,
+                        images,
+                        img_masks,
+                        shared_image_prefix,
+                        compute_subtask_loss=compute_subtask_loss,
+                        compute_fast_loss=compute_fast_loss and not joint_fast_flow,
+                    )
+                )
+            if not compute_action_loss:
+                return loss
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -385,9 +458,20 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        if joint_fast_flow:
+            joint_lang_tokens = observation.fast_tokenized_prompt
+            joint_lang_masks = observation.fast_tokenized_prompt_mask
+        else:
+            joint_lang_tokens = lang_tokens
+            joint_lang_masks = lang_masks
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, image_prefix=shared_image_prefix
+            images, img_masks, joint_lang_tokens, joint_lang_masks, image_prefix=shared_image_prefix
         )
+        if joint_fast_flow:
+            fast_token_ar_mask = observation.fast_token_ar_mask.to(device=prefix_att_masks.device)
+            prefix_att_masks = prefix_att_masks.clone()
+            prefix_att_masks[:, -fast_token_ar_mask.shape[-1] :] = fast_token_ar_mask
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -400,7 +484,20 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        if joint_fast_flow:
+            prefix_len = prefix_pad_masks.shape[1]
+            image_prefix_len = shared_image_prefix[1].shape[1] if shared_image_prefix is not None else prefix_pad_masks.shape[1] - joint_lang_tokens.shape[1]
+            fast_loss_mask = observation.fast_token_loss_mask.to(device=att_2d_masks.device).bool()
+            fast_answer_mask = torch.zeros_like(prefix_pad_masks, dtype=torch.bool)
+            fast_answer_mask[:, image_prefix_len:] = fast_loss_mask
+            att_2d_masks[:, prefix_len:, :prefix_len] &= ~fast_answer_mask[:, None, :]
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            image_prefix_valid_lens = prefix_pad_masks[:, :image_prefix_len].sum(dim=1)
+            flow_prefix_offsets = image_prefix_valid_lens + lang_masks.sum(dim=1)
+            suffix_position_ids = flow_prefix_offsets[:, None] + torch.cumsum(suffix_pad_masks, dim=1) - 1
+            position_ids = torch.cat([prefix_position_ids, suffix_position_ids], dim=1)
+        else:
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
@@ -409,7 +506,7 @@ class PI0Pytorch(nn.Module):
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, knowledge_isolation):
             # Ensure mask dtype matches embeddings (gradient checkpointing may recompute in float32)
             att_2d_masks_4d = att_2d_masks_4d.to(dtype=prefix_embs.dtype)
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -418,9 +515,9 @@ class PI0Pytorch(nn.Module):
                 adarms_cond=[None, adarms_cond],
                 knowledge_isolation=knowledge_isolation,
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond, knowledge_isolation
         )
 
@@ -436,11 +533,26 @@ class PI0Pytorch(nn.Module):
         flow_loss = F.mse_loss(u_t, v_t, reduction="none")
 
         if self.pi05_ki:
+            if joint_fast_flow:
+                loss["fast"] = self._token_ar_loss_from_hidden(
+                    prefix_out,
+                    observation.fast_tokenized_prompt,
+                    observation.fast_token_loss_mask,
+                )
             loss["action"] = flow_loss.mean()
             return loss
         return flow_loss
 
-    def forward_language_model(self, observation, images, img_masks, shared_image_prefix=None) -> dict:
+    def forward_language_model(
+        self,
+        observation,
+        images,
+        img_masks,
+        shared_image_prefix=None,
+        *,
+        compute_subtask_loss=True,
+        compute_fast_loss=True,
+    ) -> dict:
         """Compute autoregressive token losses (subtask + fast) for PI05_KI training.
 
         Both losses are cross-entropy AR losses over the respective token sequences.
@@ -463,21 +575,8 @@ class PI0Pytorch(nn.Module):
             )
             return prefix_out
 
-        def language_out_proj_func(hidden, logits_to_keep):
-            return self.paligemma_with_expert.paligemma.lm_head(hidden[:, -logits_to_keep:, :])
-
-        def token_ar_loss(logits, labels, loss_mask):
-            """Cross-entropy AR loss masked to postfix tokens only."""
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-                reduction="none",
-            )
-            loss = loss.view_as(labels) * loss_mask
-            return loss.sum() / (loss_mask.sum() + 1e-6)
-
         # --- Subtask AR loss ---
-        if self.enable_subtask_loss:
+        if self.enable_subtask_loss and compute_subtask_loss:
             subtask_tokenized_prompt      = observation.subtask_tokenized_prompt
             subtask_tokenized_prompt_mask = observation.subtask_tokenized_prompt_mask
             subtask_token_ar_mask         = observation.subtask_token_ar_mask
@@ -501,15 +600,14 @@ class PI0Pytorch(nn.Module):
             subtask_att_2d_masks_4d  = self._prepare_attention_masks_4d(subtask_att_2d_masks)
 
             subtask_prefix_out = self._apply_checkpoint(forward_func, subtask_prefix_embs, subtask_att_2d_masks_4d, subtask_position_ids)
-            subtask_logits = self._apply_checkpoint(language_out_proj_func, subtask_prefix_out, subtask_tokenized_prompt.shape[1])
-
-            subtask_shift_logits    = subtask_logits[:, :-1, :].contiguous()
-            subtask_shift_labels    = subtask_tokenized_prompt[:, 1:].contiguous()
-            subtask_shift_loss_mask = subtask_token_loss_mask[:, 1:].float().contiguous()
-            losses["subtask"] = token_ar_loss(subtask_shift_logits, subtask_shift_labels, subtask_shift_loss_mask)
+            losses["subtask"] = self._token_ar_loss_from_hidden(
+                subtask_prefix_out,
+                subtask_tokenized_prompt,
+                subtask_token_loss_mask,
+            )
 
         # --- FAST AR loss ---
-        if self.enable_fast_loss:
+        if self.enable_fast_loss and compute_fast_loss:
             fast_tokenized_prompt      = observation.fast_tokenized_prompt
             fast_tokenized_prompt_mask = observation.fast_tokenized_prompt_mask
             fast_token_ar_mask         = observation.fast_token_ar_mask
@@ -533,12 +631,11 @@ class PI0Pytorch(nn.Module):
             fast_att_2d_masks_4d  = self._prepare_attention_masks_4d(fast_att_2d_masks)
 
             fast_prefix_out = self._apply_checkpoint(forward_func, fast_prefix_embs, fast_att_2d_masks_4d, fast_position_ids)
-            fast_logits = self._apply_checkpoint(language_out_proj_func, fast_prefix_out, fast_tokenized_prompt.shape[1])
-
-            fast_shift_logits    = fast_logits[:, :-1, :].contiguous()
-            fast_shift_labels    = fast_tokenized_prompt[:, 1:].contiguous()
-            fast_shift_loss_mask = fast_token_loss_mask[:, 1:].float().contiguous()
-            losses["fast"] = token_ar_loss(fast_shift_logits, fast_shift_labels, fast_shift_loss_mask)
+            losses["fast"] = self._token_ar_loss_from_hidden(
+                fast_prefix_out,
+                fast_tokenized_prompt,
+                fast_token_loss_mask,
+            )
 
         return losses
 

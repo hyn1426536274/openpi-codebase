@@ -46,7 +46,15 @@ NUM_GPUS="${1:-$AVAILABLE_GPUS}"
 
 ## train form pi05 official (pi05_base jax to torch)
 # CONFIG_NAME="${2:-libero10_pi05_alltasks_official}" 
-CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official}" 
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official}"
+
+## ki framework changes (refer to openpi-comet-clean)
+## llm forward only once in a single batch
+# CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_split}"
+
+CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_split}"
+# CONFIG_NAME="${2:-libero10_pi05_alltasks_official}"
+
 
 ## ki component ablation with pi05_base official model
 # CONFIG_NAME="${2:-libero10_pi05ki_alltasks_official_no_fast}" # ki_official_no_fast

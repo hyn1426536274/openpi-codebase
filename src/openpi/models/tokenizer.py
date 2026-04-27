@@ -49,8 +49,9 @@ class PaligemmaTokenizer:
 
 
 class SubtaskTokenizer:
-    def __init__(self, max_len: int = 48):
+    def __init__(self, max_len: int = 48, subtask_label_in_prefix: bool = False):
         self._max_len = max_len
+        self._subtask_label_in_prefix = subtask_label_in_prefix
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
@@ -70,10 +71,11 @@ class SubtaskTokenizer:
             # Pi0 format: state is part of continuous action expert input
             prefix_tokens = self._paligemma_tokenizer.encode(cleaned_text, add_bos=True) + self._paligemma_tokenizer.encode("\n")
 
-        if subtask is not None:
-            postfix_tokens = self._paligemma_tokenizer.encode(f"Subtask: {subtask}.", add_eos=True)
+        if self._subtask_label_in_prefix:
+            prefix_tokens = prefix_tokens + self._paligemma_tokenizer.encode("Subtask: ")
+            postfix_tokens = self._paligemma_tokenizer.encode(f"{subtask}.", add_eos=True) if subtask is not None else []
         else:
-            postfix_tokens = []
+            postfix_tokens = self._paligemma_tokenizer.encode(f"Subtask: {subtask}.", add_eos=True) if subtask is not None else []
 
         # Create output token sequence & masks
         # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
@@ -105,8 +107,14 @@ class SubtaskTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+        action_label_in_prefix: bool = False,
+    ):
         self._max_len = max_len
+        self._action_label_in_prefix = action_label_in_prefix
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -129,6 +137,8 @@ class FASTTokenizer:
         state_str = " ".join(map(str, discretized_state))
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
         prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+        if self._action_label_in_prefix:
+            prefix_tokens = prefix_tokens + self._paligemma_tokenizer.encode("Action: ")
 
         if actions is not None:
             # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
@@ -136,11 +146,9 @@ class FASTTokenizer:
             action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
 
             # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
-            postfix_tokens = (
-                self._paligemma_tokenizer.encode("Action: ")
-                + action_tokens_in_pg.tolist()
-                + self._paligemma_tokenizer.encode("|", add_eos=True)
-            )
+            postfix_tokens = action_tokens_in_pg.tolist() + self._paligemma_tokenizer.encode("|", add_eos=True)
+            if not self._action_label_in_prefix:
+                postfix_tokens = self._paligemma_tokenizer.encode("Action: ") + postfix_tokens
         else:
             postfix_tokens = []
 
